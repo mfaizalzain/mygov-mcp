@@ -205,6 +205,8 @@ def get_opendosm(dataset_id, limit=100, filters=None):
 def get_gtfs_static_summary(agency):
     """Download GTFS static ZIP and summarize routes/stops/trips."""
     THROTTLE.wait("gtfs")
+    if not re.match(r"^[a-z0-9-]{1,32}$", agency):
+        return {"error": "invalid agency"}
     if agency.startswith("prasarana"):
         data = api_get(f"/gtfs-static/{agency}?category=rapid-bus-kl")
     else:
@@ -226,6 +228,10 @@ def get_gtfs_static_summary(agency):
 
 def get_gtfs_realtime(agency, category=None):
     THROTTLE.wait("gtfs")
+    if not re.match(r"^[a-z0-9-]{1,32}$", agency):
+        return {"error": "invalid agency"}
+    if category and not re.match(r"^[a-z0-9-]{1,32}$", category):
+        return {"error": "invalid category"}
     path = f"/gtfs-realtime/vehicle-position/{agency}"
     if category:
         path += f"?category={category}"
@@ -425,6 +431,14 @@ def rpc_error(id_, code, message):
 
 def call_tool(name, args):
     a = args or {}
+    # Clamp client-supplied limits - an arbitrary huge value would force a
+    # giant upstream fetch.
+    def _clamp(v, default):
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return default
+        return max(1, min(n, 1000))
     if name == "mygov_weather_forecast":
         return get_weather_forecast(a.get("location"))
     if name == "mygov_weather_warning":
@@ -432,11 +446,11 @@ def call_tool(name, args):
     if name == "mygov_data_catalogue":
         filters = {k: v for k, v in a.items()
                    if k in ("filter", "contains", "sort", "date_start", "date_end") and v}
-        return get_data_catalogue(a.get("dataset_id", ""), a.get("limit", 100), filters)
+        return get_data_catalogue(a.get("dataset_id", ""), _clamp(a.get("limit"), 100), filters)
     if name == "mygov_opendosm":
         filters = {k: v for k, v in a.items()
                    if k in ("filter", "sort", "date_start", "date_end") and v}
-        return get_opendosm(a.get("dataset_id", ""), a.get("limit", 100), filters)
+        return get_opendosm(a.get("dataset_id", ""), _clamp(a.get("limit"), 100), filters)
     if name == "mygov_gtfs_static_summary":
         return get_gtfs_static_summary(a.get("agency", "ktmb"))
     if name == "mygov_gtfs_realtime":
@@ -445,7 +459,10 @@ def call_tool(name, args):
         provider = str(a.get("provider", "RKL")).upper()
         if provider not in ("RKL", "RPG", "RKN"):
             raise ValueError(f"unknown provider {provider} (use RKL, RPG, or RKN)")
-        return get_rapid_bus_live(provider, str(a.get("route", "")))
+        route = str(a.get("route", ""))
+        if route and not re.match(r"^[A-Za-z0-9-]{1,16}$", route):
+            raise ValueError("invalid route")
+        return get_rapid_bus_live(provider, route)
     raise ValueError(f"Unknown tool: {name}")
 
 
