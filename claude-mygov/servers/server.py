@@ -336,6 +336,47 @@ def get_flood_risk():
     }
 
 
+def get_pricecatcher(item="", group="", limit=20):
+    """PriceCatcher grocery price index (KPDN, 198-item basket, daily)."""
+    req = urllib.request.Request(
+        "https://mygov.faizalmzain.com/prices.json",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://mygov.faizalmzain.com)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    q = str(item or "").strip().lower()
+    grp = str(group or "").strip().upper()
+    try:
+        lim = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        lim = 20
+    items = data.get("items") or []
+    if q:
+        items = [it for it in items if q in str(it.get("n", "")).lower()]
+    if grp:
+        items = [it for it in items if str(it.get("g", "")) == grp]
+    items = items[:lim]
+    out = []
+    for it in items:
+        p = it.get("p") or []
+        months = data.get("months") or []
+        out.append({
+            "item": it.get("n"), "unit": it.get("u"), "group": it.get("g"),
+            "kind": it.get("k"),
+            "latest_price": p[-1] if p else None,
+            "mom_pct": it.get("mom"), "yoy_pct": it.get("yoy"),
+            "price_history": [{"month": months[i], "price": v}
+                              for i, v in enumerate(p) if i < len(months)],
+        })
+    basket = data.get("basket") or {}
+    return {
+        "generated": data.get("generated"), "as_of": data.get("asOf"),
+        "months": data.get("months"),
+        "basket": {"n": basket.get("n"), "base": basket.get("base"),
+                   "national_index": basket.get("national")} if basket else None,
+        "items": out,
+    }
+
+
 TOOLS = [
     {
         "name": "mygov_weather_forecast",
@@ -453,6 +494,24 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
     },
+    {
+        "name": "mygov_pricecatcher",
+        "description": "Malaysia grocery price index (KPDN PriceCatcher, 198-item "
+                       "basket). Search items by name (e.g. TOMATO, RICE, ONION) or "
+                       "filter by group (BARANGAN SEGAR, MAKANAN KERING, MINUMAN...). "
+                       "Returns each item's current price, unit, month-on-month and "
+                       "year-on-year change, plus the 13-month price history. Updated "
+                       "daily by the dashboard's PriceCatcher collector.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item": {"type": "string", "description": "Item name substring search (case-insensitive)"},
+                "group": {"type": "string", "description": "Optional item group filter, e.g. BARANGAN SEGAR"},
+                "limit": {"type": "integer", "description": "Max items to return (default 20, max 1000)"},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+    },
 ]
 
 
@@ -500,6 +559,9 @@ def call_tool(name, args):
         return get_rapid_bus_live(provider, route)
     if name == "mygov_flood_risk":
         return get_flood_risk()
+    if name == "mygov_pricecatcher":
+        return get_pricecatcher(a.get("item", ""), a.get("group", ""),
+                                a.get("limit", 20))
     raise ValueError(f"Unknown tool: {name}")
 
 
