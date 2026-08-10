@@ -14,7 +14,8 @@ Use the `mygov_*` MCP tools to query live Malaysian government open data. No API
 - `mygov_data_catalogue` — general gov datasets; known ids: `fuelprice` (RON95/97/diesel, sort=-date), `exchangerates`, `interestrates`, `poskod`.
 - `mygov_opendosm` — DOSM economics; ids: `cpi_core` (CPI), `ipi`, `ppi`, `sppi`, `iowrt`.
 - `mygov_gtfs_static_summary` — GTFS schedule ZIP summary: agencies ktmb, prasarana, mybas-kota-bharu, mybas-alor-setar, mybas-kuala-terengganu, mybas-johor-bahru.
-- `mygov_gtfs_realtime` — live vehicles: ktmb, prasarana (category rapid-bus-kl / rapid-rail-kl), mybas-*.
+- `mygov_gtfs_realtime` — live vehicles from GTFS-RT: ktmb, prasarana (category rapid-bus-kl / rapid-rail-kl), mybas-*. NOTE: the prasarana GTFS-RT feed is often empty.
+- `mygov_rapid_bus_live` — **actual** live Rapid KL/Penang/Kuantan bus positions from the official myrapidbus kiosk feed (800+ buses). Providers: RKL (Klang Valley), RPG (Penang), RKN (Kuantan). Optional route filter. Use this instead of mygov_gtfs_realtime for Rapid buses.
 
 ## Query syntax
 

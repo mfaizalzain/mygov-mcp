@@ -9,6 +9,7 @@ API reference: https://developer.data.gov.my  (base: https://api.data.gov.my)
 Rate limit: 4 req/min per API family — the server keeps a per-family throttle.
 """
 import json
+import re
 import sys
 import urllib.request
 import urllib.parse
@@ -237,6 +238,76 @@ def get_gtfs_realtime(agency, category=None):
     }
 
 
+# ---- Rapid KL live bus feed (myrapidbus kiosk data source) ----
+# The api.data.gov.my GTFS-RT feed for prasarana is frequently empty, but the
+# official kiosk (myrapidbus.prasarana.com.my/kiosk) shows live buses from a
+# socket.io server (rapidbus-socketio-avl.prasarana.com.my). socket.io's
+# engine.io polling transport is plain HTTP, so it can be consumed without a
+# websocket client:
+#   1. GET  /socket.io/?EIO=4&transport=polling   -> 0{"sid":...}
+#   2. POST 40{...} connect, POST 42["onFts-reload",{...}] emit
+#   3. GET  poll -> 42["onFts-client","<base64(gzip(json))>"]
+RAPID_SID = "m0ckulfr515l5s79sgd2hhva9iqm3cr2"  # shared kiosk sid
+RAPID_URL = "https://rapidbus-socketio-avl.prasarana.com.my/socket.io/"
+
+
+def _rapid_post(url, payload):
+    req = urllib.request.Request(url, data=payload.encode("utf-8"),
+                                 headers={"Content-Type": "text/plain;charset=UTF-8",
+                                          "User-Agent": "Mozilla/5.0 mygov-mcp"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        r.read()
+
+
+def get_rapid_bus_live(provider="RKL", route=""):
+    t = int(time.time() * 1000)
+    with urllib.request.urlopen(f"{RAPID_URL}?EIO=4&transport=polling&t={t}",
+                                timeout=20) as r:
+        open_text = r.read().decode("utf-8", "replace")
+    m = re.search(r'^0\{"sid":"([^"]+)"', open_text)
+    if not m:
+        return {"error": "handshake_failed", "raw": open_text[:80]}
+    sid = m.group(1)
+    base = f"{RAPID_URL}?EIO=4&transport=polling&sid={sid}"
+    _rapid_post(f"{base}&t={int(time.time()*1000)}",
+                f'40{{"sid":"{RAPID_SID}","uid":""}}')
+    _rapid_post(f"{base}&t={int(time.time()*1000)}",
+                f'42["onFts-reload",{{"sid":"{RAPID_SID}","uid":"",'
+                f'"provider":"{provider}","route":"{route}"}}]')
+    time.sleep(1.5)
+    with urllib.request.urlopen(f"{base}&t={int(time.time()*1000)}",
+                                timeout=20) as r:
+        poll_text = r.read().decode("utf-8", "replace")
+    payload = None
+    for frame in poll_text.split("\x1e"):
+        fm = re.match(r'^42\["onFts-client","(.*)"\]$', frame, re.S)
+        if fm:
+            payload = fm.group(1)
+            break
+    if not payload:
+        return {"error": "no_data_frame", "raw": poll_text[:80]}
+    import base64
+    import gzip as _gzip
+    jdata = json.loads(_gzip.decompress(base64.b64decode(payload)).decode("utf-8"))
+    buses = jdata if isinstance(jdata, list) else []
+    return {
+        "provider": provider,
+        "route": route or "all",
+        "live_buses": len(buses),
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "buses": [
+            {
+                "bus_no": b.get("bus_no"), "latitude": b.get("latitude"),
+                "longitude": b.get("longitude"), "route": b.get("route"),
+                "dir": b.get("dir"), "speed": b.get("speed"),
+                "angle": b.get("angle"), "dt_gps": b.get("dt_gps"),
+                "trip_no": b.get("trip_no"), "accessibility": b.get("accessibility"),
+            }
+            for b in buses[:200]
+        ],
+    }
+
+
 # ---- MCP protocol (stdio JSON-RPC 2.0) ----
 TOOLS = [
     {
@@ -313,12 +384,30 @@ TOOLS = [
         "name": "mygov_gtfs_realtime",
         "description": "Live vehicle positions (GTFS-realtime protobuf). Agencies: ktmb, "
                        "prasarana (category rapid-bus-kl / rapid-rail-kl), mybas-*. "
-                       "Returns count + vehicle id/lat/lon list.",
+                       "Returns count + vehicle id/lat/lon list. NOTE: the prasarana "
+                       "GTFS-RT feed is often empty - use mygov_rapid_bus_live for "
+                       "actual Rapid KL bus positions.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "agency": {"type": "string", "description": "ktmb, prasarana, or mybas-*"},
                 "category": {"type": "string", "description": "For prasarana: rapid-bus-kl, rapid-rail-kl, ..."},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+    },
+    {
+        "name": "mygov_rapid_bus_live",
+        "description": "Live Rapid KL / Rapid Penang / Rapid Kuantan bus positions from the "
+                       "official myrapidbus kiosk feed (800+ buses). Providers: RKL (Klang "
+                       "Valley), RPG (Penang), RKN (Kuantan). Optional route filter "
+                       "(e.g. T2000, 300). Returns bus_no, lat/lon, route, speed, direction, "
+                       "last GPS time.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "provider": {"type": "string", "description": "RKL, RPG, or RKN (default RKL)"},
+                "route": {"type": "string", "description": "Optional route number filter"},
             },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
@@ -352,6 +441,11 @@ def call_tool(name, args):
         return get_gtfs_static_summary(a.get("agency", "ktmb"))
     if name == "mygov_gtfs_realtime":
         return get_gtfs_realtime(a.get("agency", "ktmb"), a.get("category"))
+    if name == "mygov_rapid_bus_live":
+        provider = str(a.get("provider", "RKL")).upper()
+        if provider not in ("RKL", "RPG", "RKN"):
+            raise ValueError(f"unknown provider {provider} (use RKL, RPG, or RKN)")
+        return get_rapid_bus_live(provider, str(a.get("route", "")))
     raise ValueError(f"Unknown tool: {name}")
 
 
