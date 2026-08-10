@@ -315,6 +315,27 @@ def get_rapid_bus_live(provider="RKL", route=""):
 
 
 # ---- MCP protocol (stdio JSON-RPC 2.0) ----
+def get_flood_risk():
+    """Live flood risk from JPS telemetry, via the dashboard's /api/flood proxy.
+
+    The proxy fetches JPS's ~1.3 MB gauge feed server-side, keeps only
+    danger/warning/alert stations with a reading in the last 24h (dead gauges
+    excluded), and slims each station to name/coords/level/trend/timestamp.
+    """
+    t = int(time.time())
+    req = urllib.request.Request(
+        f"https://mygov.faizalmzain.com/api/flood?cb={t}",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://mygov.faizalmzain.com)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    return {
+        "updated": data.get("updated"),
+        "at_risk": data.get("at_risk"),
+        "states": data.get("states", []),
+        "stations": data.get("stations", []),
+    }
+
+
 TOOLS = [
     {
         "name": "mygov_weather_forecast",
@@ -418,6 +439,20 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
     },
+    {
+        "name": "mygov_flood_risk",
+        "description": "Live flood risk from JPS (Department of Irrigation and Drainage) "
+                       "water-level telemetry. Returns stations currently at "
+                       "danger/warning/alert (only gauges that reported within the last "
+                       "24h - dead gauges excluded), each with name, state, district, "
+                       "lat/lon, water level, danger threshold, trend and last reading "
+                       "time, plus a per-state count summary.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+    },
 ]
 
 
@@ -463,6 +498,8 @@ def call_tool(name, args):
         if route and not re.match(r"^[A-Za-z0-9-]{1,16}$", route):
             raise ValueError("invalid route")
         return get_rapid_bus_live(provider, route)
+    if name == "mygov_flood_risk":
+        return get_flood_risk()
     raise ValueError(f"Unknown tool: {name}")
 
 
