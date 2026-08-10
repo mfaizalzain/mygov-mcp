@@ -1,0 +1,8 @@
+{
+  "mcp_servers": {
+    "mygov": {
+      "command": "python3",
+      "args": ["${PLUGIN_ROOT}/servers/server.py"]
+    }
+  }
+}

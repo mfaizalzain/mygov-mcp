@@ -1,0 +1,32 @@
+{
+  "name": "mygov",
+  "version": "1.0.0",
+  "description": "Malaysia government open data: weather, fuel prices, CPI, GTFS transit, live trains.",
+  "author": {
+    "name": "Faizal Zain",
+    "url": "https://github.com/mfaizalzain"
+  },
+  "homepage": "https://mygov.faizalmzain.com",
+  "repository": "https://github.com/mfaizalzain/mygov-mcp",
+  "license": "MIT",
+  "keywords": ["malaysia", "opendata", "weather", "gtfs"],
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "mygov — Malaysia Gov Open Data",
+    "shortDescription": "Malaysia gov open data: weather, fuel, CPI, transit.",
+    "longDescription": "Query Malaysian government open data via api.data.gov.my: 7-day weather forecasts and warnings (MET Malaysia), weekly fuel prices, CPI and economic statistics (OpenDOSM), GTFS static schedules and live vehicle positions (KTMB, Prasarana, mybas).",
+    "developerName": "Faizal Zain",
+    "category": "Productivity",
+    "capabilities": ["Read"],
+    "websiteURL": "https://mygov.faizalmzain.com",
+    "privacyPolicyURL": "https://mygov.faizalmzain.com",
+    "termsOfServiceURL": "https://mygov.faizalmzain.com",
+    "brandColor": "#10A37F",
+    "defaultPrompt": [
+      "What's the weather in Kota Bharu this week?",
+      "What are the latest fuel prices in Malaysia?",
+      "Show me live KTMB train positions."
+    ]
+  }
+}

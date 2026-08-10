@@ -1,0 +1,14 @@
+{
+  "name": "mygov",
+  "displayName": "mygov — Malaysia Gov Open Data",
+  "version": "1.0.0",
+  "description": "Malaysia government open data: weather, fuel prices, CPI, GTFS transit, live trains.",
+  "author": {
+    "name": "Faizal Zain",
+    "url": "https://github.com/mfaizalzain"
+  },
+  "repository": "https://github.com/mfaizalzain/mygov-mcp",
+  "license": "MIT",
+  "keywords": ["malaysia", "opendata", "weather", "gtfs", "data.gov.my"],
+  "mcpServers": "./.mcp.json"
+}

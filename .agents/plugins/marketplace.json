@@ -1,0 +1,20 @@
+{
+  "name": "mygov-local",
+  "interface": {
+    "displayName": "mygov (local test)"
+  },
+  "plugins": [
+    {
+      "name": "mygov",
+      "source": {
+        "source": "local",
+        "path": "./codex-mygov"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
