@@ -377,6 +377,36 @@ def get_pricecatcher(item="", group="", limit=20):
     }
 
 
+def get_tourism(country="", limit=10):
+    """Monthly visitor arrivals (Tourism Malaysia, top 51, ~1 month lag)."""
+    req = urllib.request.Request(
+        "https://mygov.faizalmzain.com/tourism.json",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://mygov.faizalmzain.com)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    q = str(country or "").strip().lower()
+    try:
+        lim = max(1, min(int(limit), 100))
+    except (TypeError, ValueError):
+        lim = 10
+    rows = data.get("visitor") or []
+    if q:
+        rows = [r for r in rows if q in str(r.get("country", "")).lower()]
+    rows = rows[:lim]
+    out = [{
+        "rank": r.get("rank"), "country": r.get("country"),
+        "arrivals": r.get("cur"), "prev_month": r.get("prev"),
+        "yoy_pct": r.get("g_yoy"), "vs_2019_pct": r.get("g_2019"),
+        "mom_pct": r.get("g_mom"), "ytd_arrivals": r.get("ytd26"),
+        "ytd_yoy_pct": r.get("gy_yoy"),
+    } for r in rows]
+    return {
+        "as_of": data.get("asOf"), "generated": data.get("generated"),
+        "totals": data.get("totals"),
+        "countries": out,
+    }
+
+
 TOOLS = [
     {
         "name": "mygov_weather_forecast",
@@ -512,6 +542,24 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
     },
+    {
+        "name": "mygov_tourism_arrivals",
+        "description": "Malaysia monthly international visitor arrivals by country "
+                       "of nationality (Tourism Malaysia, top 51). Returns the "
+                       "month's total, month-on-month and year-on-year growth vs "
+                       "2025 and 2019, plus the year-to-date picture. Optional "
+                       "country filter (e.g. SINGAPORE, CHINA) and limit. Data "
+                       "updates monthly (~1 month lag); use for tourism demand, "
+                       "recovery vs pre-pandemic 2019, and top source markets.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "country": {"type": "string", "description": "Country/nationality filter, case-insensitive substring (e.g. SINGAPORE, CHINA, INDIA)"},
+                "limit": {"type": "integer", "description": "Max countries to return (default 10, max 100)"},
+            },
+        },
+        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+    },
 ]
 
 
@@ -562,6 +610,8 @@ def call_tool(name, args):
     if name == "mygov_pricecatcher":
         return get_pricecatcher(a.get("item", ""), a.get("group", ""),
                                 a.get("limit", 20))
+    if name == "mygov_tourism_arrivals":
+        return get_tourism(a.get("country", ""), a.get("limit", 10))
     raise ValueError(f"Unknown tool: {name}")
 
 
