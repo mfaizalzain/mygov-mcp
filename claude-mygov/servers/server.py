@@ -324,8 +324,8 @@ def get_flood_risk():
     """
     t = int(time.time())
     req = urllib.request.Request(
-        f"https://mygov.faizalmzain.com/api/flood?cb={t}",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://mygov.faizalmzain.com)"})
+        f"https://malaysia-at-a-glance.com/api/flood?cb={t}",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read().decode("utf-8", "replace"))
     return {
@@ -339,8 +339,8 @@ def get_flood_risk():
 def get_pricecatcher(item="", group="", limit=20):
     """PriceCatcher grocery price index (KPDN, 198-item basket, daily)."""
     req = urllib.request.Request(
-        "https://mygov.faizalmzain.com/prices.json",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://mygov.faizalmzain.com)"})
+        "https://malaysia-at-a-glance.com/prices.json",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read().decode("utf-8", "replace"))
     q = str(item or "").strip().lower()
@@ -380,8 +380,8 @@ def get_pricecatcher(item="", group="", limit=20):
 def get_tourism(country="", limit=10):
     """Monthly visitor arrivals (Tourism Malaysia, top 51, ~1 month lag)."""
     req = urllib.request.Request(
-        "https://mygov.faizalmzain.com/tourism.json",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://mygov.faizalmzain.com)"})
+        "https://malaysia-at-a-glance.com/tourism.json",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read().decode("utf-8", "replace"))
     q = str(country or "").strip().lower()

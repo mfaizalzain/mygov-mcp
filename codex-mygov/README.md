@@ -25,9 +25,9 @@ The OpenAI portal scans your MCP server over **HTTPS** — a stdio-only bundle i
 not enough for the public directory. You need:
 
 1. **Host the server publicly** — expose the MCP server as streamable HTTP, e.g.
-   an `/mcp` route on the mygov Cloudflare Worker (mygov.faizalmzain.com).
+   an `/mcp` route on the mygov Cloudflare Worker (malaysia-at-a-glance.com).
 2. **Domain verification** — host the portal token at
-   `https://mygov.faizalmzain.com/.well-known/openai-apps-challenge`.
+   `https://malaysia-at-a-glance.com/.well-known/openai-apps-challenge`.
 3. **Verify identity** — individual or business verification in OpenAI Platform,
    plus `Apps Management: Write` on your org role.
 4. Submit at **platform.openai.com/plugins** → Create plugin → With MCP:
