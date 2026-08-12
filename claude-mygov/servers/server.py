@@ -407,6 +407,55 @@ def get_tourism(country="", limit=10):
     }
 
 
+def get_rapid_service_alert():
+    """Latest Rapid KL service alert (myrapid.com.my PULSE).
+
+    The source is behind Incapsula (a JS-challenge WAF; its wp-json also
+    returns 401 for anonymous reads), so the dashboard's collect_rapid
+    workflow scrapes it via the r.jina.ai reader every 10 min and publishes
+    the newest post as rapid_alerts.json. This tool returns that file - the
+    same data the dashboard's alert deck shows: one card, latest post only.
+    """
+    req = urllib.request.Request(
+        "https://malaysia-at-a-glance.com/rapid_alerts.json",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    latest = data.get("latest") or {}
+    return {
+        "updated": data.get("updated"),
+        "title": latest.get("title"),
+        "excerpt": latest.get("excerpt"),
+        "url": latest.get("url"),
+        "posted_epoch": latest.get("ts"),
+    }
+
+
+def get_air_quality():
+    """Live air quality index for 18 major Malaysian cities.
+
+    Polls Open-Meteo's hourly air-quality model (free, keyless - the
+    official APIMS feed blocks non-browser clients) via the dashboard's
+    /api/aqi proxy. Returns every city's US AQI and PM2.5, worst first,
+    plus the cleanest station for comparison. US AQI 101+ is the haze
+    alert threshold (Unhealthy).
+    """
+    t = int(time.time())
+    req = urllib.request.Request(
+        f"https://malaysia-at-a-glance.com/api/aqi?cb={t}",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    stations = data.get("stations") or []
+    return {
+        "updated": data.get("updated"),
+        "reading_time": data.get("reading_time"),
+        "worst": data.get("worst"),
+        "cleanest": data.get("cleanest"),
+        "stations": stations,
+    }
+
+
 TOOLS = [
     {
         "name": "mygov_weather_forecast",
@@ -560,6 +609,23 @@ TOOLS = [
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
     },
+    {
+        "name": "mygov_rapid_service_alert",
+        "description": "Latest Rapid KL service alert (LRT/MRT/monorail/bus disruption, myrapid.com.my "
+                       "PULSE). Returns the newest post only: title, excerpt, link, posted time. "
+                       "Source is behind Incapsula; collected via the dashboard every 10 min.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+    },
+    {
+        "name": "mygov_air_quality",
+        "description": "Live air quality index (US AQI) for 18 major Malaysian cities "
+                       "(Open-Meteo hourly model). Returns every city's AQI and PM2.5 sorted "
+                       "worst-first, plus the cleanest station for comparison. US AQI 101+ "
+                       "(Unhealthy) is the haze alert threshold.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+    },
 ]
 
 
@@ -612,6 +678,10 @@ def call_tool(name, args):
                                 a.get("limit", 20))
     if name == "mygov_tourism_arrivals":
         return get_tourism(a.get("country", ""), a.get("limit", 10))
+    if name == "mygov_rapid_service_alert":
+        return get_rapid_service_alert()
+    if name == "mygov_air_quality":
+        return get_air_quality()
     raise ValueError(f"Unknown tool: {name}")
 
 
