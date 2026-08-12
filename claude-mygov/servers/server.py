@@ -10,7 +10,9 @@ Rate limit: 4 req/min per API family — the server keeps a per-family throttle.
 """
 import json
 import re
+import socket
 import sys
+import urllib.error
 import urllib.request
 import urllib.parse
 import struct
@@ -20,6 +22,183 @@ import io
 from collections import defaultdict
 
 BASE = "https://api.data.gov.my"
+DASH = "https://malaysia-at-a-glance.com"
+UA = "mygov-mcp/1.1 (+https://malaysia-at-a-glance.com)"
+
+
+# ---- structured tool errors ----
+# Agents react far better to a machine-readable code than to a stringified
+# Python exception, so every failure path raises ToolError and the tools/call
+# handler serializes it as an isError result with a stable code.
+class ToolError(Exception):
+    def __init__(self, code, message, retryable=False, retry_after_seconds=None,
+                 details=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+        self.details = details
+
+    def to_dict(self):
+        err = {"code": self.code, "message": self.message,
+               "retryable": self.retryable}
+        if self.retry_after_seconds is not None:
+            err["retry_after_seconds"] = self.retry_after_seconds
+        if self.details:
+            err["details"] = self.details
+        return {"error": err}
+
+
+def invalid(message, **details):
+    return ToolError("INVALID_ARGUMENT", message, details=details or None)
+
+
+def _upstream_error(exc, url):
+    """Map a urllib/socket failure onto a stable ToolError code."""
+    host = urllib.parse.urlsplit(url).netloc
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 404:
+            return ToolError("NOT_FOUND", f"{host} has no data at this path",
+                             details={"status": exc.code, "url": url})
+        if exc.code == 429:
+            retry = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                retry = int(retry)
+            except (TypeError, ValueError):
+                retry = 60
+            return ToolError("UPSTREAM_RATE_LIMIT",
+                             f"{host} rate-limited this request",
+                             retryable=True, retry_after_seconds=retry,
+                             details={"status": exc.code})
+        return ToolError("UPSTREAM_UNAVAILABLE",
+                         f"{host} returned HTTP {exc.code}",
+                         retryable=exc.code >= 500,
+                         retry_after_seconds=30 if exc.code >= 500 else None,
+                         details={"status": exc.code, "url": url})
+    if isinstance(exc, socket.timeout) or isinstance(
+            getattr(exc, "reason", None), socket.timeout):
+        return ToolError("UPSTREAM_TIMEOUT", f"{host} did not respond in time",
+                         retryable=True, retry_after_seconds=15,
+                         details={"url": url})
+    return ToolError("UPSTREAM_UNAVAILABLE", f"could not reach {host}: {exc}",
+                     retryable=True, retry_after_seconds=30,
+                     details={"url": url})
+
+
+def http_get(url, headers=None, timeout=30):
+    """GET returning raw bytes, with upstream failures mapped to ToolError."""
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read(), r.headers
+    except (urllib.error.URLError, socket.timeout, OSError) as e:
+        raise _upstream_error(e, url)
+
+
+def http_get_json(url, headers=None, timeout=30):
+    body, _ = http_get(url, headers, timeout)
+    try:
+        return json.loads(body.decode("utf-8", "replace"))
+    except json.JSONDecodeError as e:
+        raise ToolError("DATA_UNAVAILABLE",
+                        f"upstream returned a non-JSON body: {e}",
+                        retryable=True, retry_after_seconds=30,
+                        details={"url": url})
+
+
+# ---- provenance ----
+# Every tool result is wrapped as {"data": ..., "meta": {...}} so a client can
+# cite the publisher, and can tell when the data is *from* apart from when it
+# was fetched. freshness is one of: live | daily | monthly | quarterly | static.
+SOURCES = {
+    "mygov_weather_forecast": {
+        "source": "Malaysian Meteorological Department (MET Malaysia)",
+        "source_url": "https://api.data.gov.my/weather/forecast",
+        "dataset": "weather/forecast", "freshness": "daily",
+        "update_frequency": "daily", "max_age_seconds": 21600},
+    "mygov_weather_warning": {
+        "source": "Malaysian Meteorological Department (MET Malaysia)",
+        "source_url": "https://api.data.gov.my/weather/warning",
+        "dataset": "weather/warning", "freshness": "live",
+        "update_frequency": "as issued", "max_age_seconds": 900},
+    "mygov_data_catalogue": {
+        "source": "Malaysia Government Open Data (data.gov.my)",
+        "source_url": "https://api.data.gov.my/data-catalogue",
+        "freshness": "varies", "update_frequency": "per dataset"},
+    "mygov_opendosm": {
+        "source": "Department of Statistics Malaysia (DOSM), OpenDOSM",
+        "source_url": "https://api.data.gov.my/opendosm",
+        "freshness": "varies", "update_frequency": "per dataset"},
+    "mygov_gtfs_static_summary": {
+        "source": "data.gov.my GTFS static feeds",
+        "source_url": "https://api.data.gov.my/gtfs-static",
+        "freshness": "static", "update_frequency": "irregular",
+        "max_age_seconds": 86400},
+    "mygov_gtfs_realtime": {
+        "source": "data.gov.my GTFS-realtime vehicle positions",
+        "source_url": "https://api.data.gov.my/gtfs-realtime/vehicle-position",
+        "freshness": "live", "update_frequency": "~30s", "max_age_seconds": 60},
+    "mygov_rapid_bus_live": {
+        "source": "Prasarana myrapidbus kiosk AVL feed",
+        "source_url": "https://myrapidbus.prasarana.com.my/kiosk",
+        "freshness": "live", "update_frequency": "~15s", "max_age_seconds": 60},
+    "mygov_flood_risk": {
+        "source": "Department of Irrigation and Drainage (JPS) telemetry",
+        "source_url": "https://publicinfobanjir.water.gov.my",
+        "freshness": "live", "update_frequency": "~15 min",
+        "max_age_seconds": 900},
+    "mygov_pricecatcher": {
+        "source": "Ministry of Domestic Trade and Cost of Living (KPDN), PriceCatcher",
+        "source_url": "https://open.dosm.gov.my/data-catalogue/pricecatcher",
+        "dataset": "pricecatcher", "freshness": "daily",
+        "update_frequency": "daily", "max_age_seconds": 86400},
+    "mygov_tourism_arrivals": {
+        "source": "Tourism Malaysia",
+        "source_url": "https://data.tourism.gov.my",
+        "freshness": "monthly", "update_frequency": "monthly (~1 month lag)",
+        "max_age_seconds": 86400},
+    "mygov_rapid_service_alert": {
+        "source": "Rapid Rail / Rapid Bus service alerts (myrapid.com.my PULSE)",
+        "source_url": "https://myrapid.com.my/pulse",
+        "freshness": "live", "update_frequency": "~10 min",
+        "max_age_seconds": 900},
+    "mygov_air_quality": {
+        "source": "Open-Meteo air-quality model (APIMS-equivalent, US AQI scale)",
+        "source_url": "https://open-meteo.com/en/docs/air-quality-api",
+        "freshness": "live", "update_frequency": "hourly",
+        "max_age_seconds": 3600},
+    "mygov_hotel_performance": {
+        "source": "Tourism Malaysia, Paid Accommodation Survey",
+        "source_url": "https://data.tourism.gov.my",
+        "freshness": "quarterly", "update_frequency": "quarterly",
+        "max_age_seconds": 86400},
+    "mygov_election_results": {
+        "source": "Suruhanjaya Pilihan Raya Malaysia (SPR)",
+        "source_url": "https://keputusan.spr.gov.my",
+        "freshness": "static", "update_frequency": "per election"},
+}
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def envelope(tool, data, data_period=None, data_updated_at=None, **extra):
+    """Wrap a tool payload with provenance.
+
+    retrieved_at is when *we* called the API; data_updated_at is when the
+    publisher last refreshed it and data_period is what the numbers describe.
+    Conflating them makes an agent report month-old figures as "today's".
+    """
+    meta = dict(SOURCES.get(tool, {}))
+    meta["retrieved_at"] = now_iso()
+    if data_period is not None:
+        meta["data_period"] = data_period
+    if data_updated_at is not None:
+        meta["data_updated_at"] = data_updated_at
+    meta.update({k: v for k, v in extra.items() if v is not None})
+    return {"data": data, "meta": meta}
 
 # ---- minimal GTFS-realtime protobuf wire parser (subset we need) ----
 def _read_varint(buf, pos):
@@ -164,18 +343,22 @@ def api_get(path, params=None):
     url = BASE + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 mygov-mcp"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        ctype = r.headers.get("Content-Type", "")
-        body = r.read()
+    body, headers = http_get(url, headers={"User-Agent": "Mozilla/5.0 mygov-mcp"})
+    ctype = headers.get("Content-Type", "")
     if "json" in ctype or path.startswith(("/data-catalogue", "/opendosm", "/weather")):
-        return json.loads(body.decode("utf-8"))
+        try:
+            return json.loads(body.decode("utf-8"))
+        except json.JSONDecodeError as e:
+            raise ToolError("DATA_UNAVAILABLE",
+                            f"data.gov.my returned a non-JSON body: {e}",
+                            retryable=True, retry_after_seconds=30,
+                            details={"url": url})
     return body  # binary (GTFS zip / protobuf)
 
 
-def get_weather_forecast(location=None):
+def get_weather_forecast(location=None, limit=50):
     THROTTLE.wait("weather")
-    params = {"limit": 200}
+    params = {"limit": limit}
     if location:
         params["contains"] = f"{location}@location__location_name"
     return api_get("/weather/forecast", params)
@@ -206,7 +389,8 @@ def get_gtfs_static_summary(agency):
     """Download GTFS static ZIP and summarize routes/stops/trips."""
     THROTTLE.wait("gtfs")
     if not re.match(r"^[a-z0-9-]{1,32}$", agency):
-        return {"error": "invalid agency"}
+        raise invalid("agency must be lowercase letters, digits or hyphens",
+                      agency=agency)
     if agency.startswith("prasarana"):
         data = api_get(f"/gtfs-static/{agency}?category=rapid-bus-kl")
     else:
@@ -226,12 +410,14 @@ def get_gtfs_static_summary(agency):
     return summary
 
 
-def get_gtfs_realtime(agency, category=None):
+def get_gtfs_realtime(agency, category=None, limit=50):
     THROTTLE.wait("gtfs")
     if not re.match(r"^[a-z0-9-]{1,32}$", agency):
-        return {"error": "invalid agency"}
+        raise invalid("agency must be lowercase letters, digits or hyphens",
+                      agency=agency)
     if category and not re.match(r"^[a-z0-9-]{1,32}$", category):
-        return {"error": "invalid category"}
+        raise invalid("category must be lowercase letters, digits or hyphens",
+                      category=category)
     path = f"/gtfs-realtime/vehicle-position/{agency}"
     if category:
         path += f"?category={category}"
@@ -240,7 +426,9 @@ def get_gtfs_realtime(agency, category=None):
     return {
         "agency": agency,
         "live_vehicles": len(vehicles),
-        "vehicles": vehicles[:100],
+        "returned": min(len(vehicles), limit),
+        "truncated": len(vehicles) > limit,
+        "vehicles": vehicles[:limit],
     }
 
 
@@ -261,18 +449,23 @@ def _rapid_post(url, payload):
     req = urllib.request.Request(url, data=payload.encode("utf-8"),
                                  headers={"Content-Type": "text/plain;charset=UTF-8",
                                           "User-Agent": "Mozilla/5.0 mygov-mcp"})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        r.read()
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read()
+    except (urllib.error.URLError, socket.timeout, OSError) as e:
+        raise _upstream_error(e, url)
 
 
-def get_rapid_bus_live(provider="RKL", route=""):
+def get_rapid_bus_live(provider="RKL", route="", limit=50):
     t = int(time.time() * 1000)
-    with urllib.request.urlopen(f"{RAPID_URL}?EIO=4&transport=polling&t={t}",
-                                timeout=20) as r:
-        open_text = r.read().decode("utf-8", "replace")
+    handshake_url = f"{RAPID_URL}?EIO=4&transport=polling&t={t}"
+    open_text = http_get(handshake_url, timeout=20)[0].decode("utf-8", "replace")
     m = re.search(r'^0\{"sid":"([^"]+)"', open_text)
     if not m:
-        return {"error": "handshake_failed", "raw": open_text[:80]}
+        raise ToolError("UPSTREAM_UNAVAILABLE",
+                        "myrapidbus kiosk feed did not complete the handshake",
+                        retryable=True, retry_after_seconds=15,
+                        details={"raw": open_text[:80]})
     sid = m.group(1)
     base = f"{RAPID_URL}?EIO=4&transport=polling&sid={sid}"
     _rapid_post(f"{base}&t={int(time.time()*1000)}",
@@ -281,9 +474,8 @@ def get_rapid_bus_live(provider="RKL", route=""):
                 f'42["onFts-reload",{{"sid":"{RAPID_SID}","uid":"",'
                 f'"provider":"{provider}","route":"{route}"}}]')
     time.sleep(1.5)
-    with urllib.request.urlopen(f"{base}&t={int(time.time()*1000)}",
-                                timeout=20) as r:
-        poll_text = r.read().decode("utf-8", "replace")
+    poll_url = f"{base}&t={int(time.time()*1000)}"
+    poll_text = http_get(poll_url, timeout=20)[0].decode("utf-8", "replace")
     payload = None
     for frame in poll_text.split("\x1e"):
         fm = re.match(r'^42\["onFts-client","(.*)"\]$', frame, re.S)
@@ -291,16 +483,25 @@ def get_rapid_bus_live(provider="RKL", route=""):
             payload = fm.group(1)
             break
     if not payload:
-        return {"error": "no_data_frame", "raw": poll_text[:80]}
+        raise ToolError("DATA_UNAVAILABLE",
+                        "myrapidbus kiosk feed returned no vehicle frame",
+                        retryable=True, retry_after_seconds=15,
+                        details={"raw": poll_text[:80]})
     import base64
     import gzip as _gzip
-    jdata = json.loads(_gzip.decompress(base64.b64decode(payload)).decode("utf-8"))
+    try:
+        jdata = json.loads(_gzip.decompress(base64.b64decode(payload)).decode("utf-8"))
+    except Exception as e:
+        raise ToolError("DATA_UNAVAILABLE",
+                        f"could not decode the kiosk vehicle frame: {e}",
+                        retryable=True, retry_after_seconds=15)
     buses = jdata if isinstance(jdata, list) else []
     return {
         "provider": provider,
         "route": route or "all",
         "live_buses": len(buses),
-        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "returned": min(len(buses), limit),
+        "truncated": len(buses) > limit,
         "buses": [
             {
                 "bus_no": b.get("bus_no"), "latitude": b.get("latitude"),
@@ -309,7 +510,7 @@ def get_rapid_bus_live(provider="RKL", route=""):
                 "angle": b.get("angle"), "dt_gps": b.get("dt_gps"),
                 "trip_no": b.get("trip_no"), "accessibility": b.get("accessibility"),
             }
-            for b in buses[:200]
+            for b in buses[:limit]
         ],
     }
 
@@ -322,12 +523,7 @@ def get_flood_risk():
     danger/warning/alert stations with a reading in the last 24h (dead gauges
     excluded), and slims each station to name/coords/level/trend/timestamp.
     """
-    t = int(time.time())
-    req = urllib.request.Request(
-        f"https://malaysia-at-a-glance.com/api/flood?cb={t}",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
+    data = http_get_json(f"{DASH}/api/flood?cb={int(time.time())}")
     return {
         "updated": data.get("updated"),
         "at_risk": data.get("at_risk"),
@@ -338,22 +534,16 @@ def get_flood_risk():
 
 def get_pricecatcher(item="", group="", limit=20):
     """PriceCatcher grocery price index (KPDN, 198-item basket, daily)."""
-    req = urllib.request.Request(
-        "https://malaysia-at-a-glance.com/prices.json",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
+    data = http_get_json(f"{DASH}/prices.json")
     q = str(item or "").strip().lower()
     grp = str(group or "").strip().upper()
-    try:
-        lim = max(1, min(int(limit), 1000))
-    except (TypeError, ValueError):
-        lim = 20
+    lim = limit
     items = data.get("items") or []
     if q:
         items = [it for it in items if q in str(it.get("n", "")).lower()]
     if grp:
         items = [it for it in items if str(it.get("g", "")) == grp]
+    matched = len(items)
     items = items[:lim]
     out = []
     for it in items:
@@ -369,8 +559,13 @@ def get_pricecatcher(item="", group="", limit=20):
         })
     basket = data.get("basket") or {}
     return {
-        "generated": data.get("generated"), "as_of": data.get("asOf"),
+        "as_of": data.get("asOf"),
+        "generated": data.get("generated"),
         "months": data.get("months"),
+        "currency": "MYR",
+        "matched": matched,
+        "returned": len(out),
+        "truncated": matched > len(out),
         "basket": {"n": basket.get("n"), "base": basket.get("base"),
                    "national_index": basket.get("national")} if basket else None,
         "items": out,
@@ -379,19 +574,13 @@ def get_pricecatcher(item="", group="", limit=20):
 
 def get_tourism(country="", limit=10):
     """Monthly visitor arrivals (Tourism Malaysia, top 51, ~1 month lag)."""
-    req = urllib.request.Request(
-        "https://malaysia-at-a-glance.com/tourism.json",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
+    data = http_get_json(f"{DASH}/tourism.json")
     q = str(country or "").strip().lower()
-    try:
-        lim = max(1, min(int(limit), 100))
-    except (TypeError, ValueError):
-        lim = 10
+    lim = limit
     rows = data.get("visitor") or []
     if q:
         rows = [r for r in rows if q in str(r.get("country", "")).lower()]
+    matched = len(rows)
     rows = rows[:lim]
     out = [{
         "rank": r.get("rank"), "country": r.get("country"),
@@ -403,6 +592,8 @@ def get_tourism(country="", limit=10):
     return {
         "as_of": data.get("asOf"), "generated": data.get("generated"),
         "totals": data.get("totals"),
+        "unit": "arrivals (persons)",
+        "matched": matched, "returned": len(out), "truncated": matched > len(out),
         "countries": out,
     }
 
@@ -416,11 +607,7 @@ def get_rapid_service_alert():
     the newest post as rapid_alerts.json. This tool returns that file - the
     same data the dashboard's alert deck shows: one card, latest post only.
     """
-    req = urllib.request.Request(
-        "https://malaysia-at-a-glance.com/rapid_alerts.json",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
+    data = http_get_json(f"{DASH}/rapid_alerts.json")
     latest = data.get("latest") or {}
     return {
         "updated": data.get("updated"),
@@ -440,15 +627,11 @@ def get_air_quality():
     plus the cleanest station for comparison. US AQI 101+ is the haze
     alert threshold (Unhealthy).
     """
-    t = int(time.time())
-    req = urllib.request.Request(
-        f"https://malaysia-at-a-glance.com/api/aqi?cb={t}",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
+    data = http_get_json(f"{DASH}/api/aqi?cb={int(time.time())}")
     stations = data.get("stations") or []
     return {
         "updated": data.get("updated"),
+        "aqi_scale": "US AQI",
         "reading_time": data.get("reading_time"),
         "worst": data.get("worst"),
         "cleanest": data.get("cleanest"),
@@ -465,13 +648,12 @@ def get_hotel_performance(state=""):
     earlier. Only the latest quarter is public on the source portal, so the
     dashboard collector probes newest-first; this returns the current quarter.
     """
-    req = urllib.request.Request(
-        "https://malaysia-at-a-glance.com/hotel.json",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
+    data = http_get_json(f"{DASH}/hotel.json")
     out = {"asOf": data.get("asOf"), "generated": data.get("generated"),
-           "source": data.get("source")}
+           "source": data.get("source"),
+           "units": {"occupancy_rate": "percent",
+                     "average_room_rate": "MYR per room-night",
+                     "guests": "persons"}}
     if state:
         state = state.strip().title()
     for key, label in (("aor", "occupancy_rate"), ("arr", "average_room_rate"),
@@ -483,7 +665,7 @@ def get_hotel_performance(state=""):
     return out
 
 
-def get_election_results(category="", state="", query=""):
+def get_election_results(category="", state="", query="", limit=50):
     """Latest election results from SPR (Suruhanjaya Pilihan Raya), via the
     dashboard's election.json.
 
@@ -493,16 +675,13 @@ def get_election_results(category="", state="", query=""):
     matched against constituency, winner or party name. Results are static
     once published - this is a one-time crawl per election.
     """
-    req = urllib.request.Request(
-        "https://malaysia-at-a-glance.com/election.json",
-        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8", "replace"))
+    data = http_get_json(f"{DASH}/election.json")
     seats = data.get("seats") or []
     if category:
         category = category.strip().lower()
         if category not in ("pru", "dun", "prk"):
-            raise ValueError("category must be pru, dun or prk")
+            raise invalid("category must be one of pru, dun, prk",
+                          category=category, allowed=["pru", "dun", "prk"])
         seats = [s for s in seats if s.get("category") == category]
     if state:
         state = state.strip().upper()
@@ -530,210 +709,360 @@ def get_election_results(category="", state="", query=""):
             "votes": w.get("votes") if w else None,
             "majority": s.get("majority"), "totalVotes": s.get("totalVotes"),
         }
-    out = {"generated": data.get("generated"), "source": data.get("source"),
-           "note": data.get("note"),
-           "categories": {k: (v or {}).get("name") for k, v in (data.get("categories") or {}).items()},
-           "count": len(seats), "seats": [_compact(s) for s in seats]}
-    return out
+    matched = len(seats)
+    page = seats[:limit]
+    return {"generated": data.get("generated"), "source": data.get("source"),
+            "note": data.get("note"),
+            "categories": {k: (v or {}).get("name")
+                           for k, v in (data.get("categories") or {}).items()},
+            "matched": matched, "returned": len(page),
+            "truncated": matched > len(page),
+            "seats": [_compact(s) for s in page]}
+
+
+# Every tool is a read-only fetch from an external government/public API, so
+# they share the same annotation set: safe to call, safe to repeat, but the
+# world beyond this server is what answers (openWorldHint).
+READ_ONLY = {
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+}
+
+
+def _limit(default, maximum, what):
+    return {"type": "integer", "minimum": 1, "maximum": maximum,
+            "default": default,
+            "description": f"Max {what} to return (default {default}, max {maximum})."}
 
 
 TOOLS = [
     {
         "name": "mygov_weather_forecast",
-        "description": "7-day weather forecast for Malaysia locations (MET Malaysia). "
-                       "Optionally filter by location name (e.g. 'Kota Bharu', 'Langkawi'). "
-                       "Returns date, morning/afternoon/night forecast, min/max temp.",
+        "description": "7-day weather forecast for Malaysian locations (MET Malaysia). "
+                       "Returns date, morning/afternoon/night forecast and min/max "
+                       "temperature in degrees Celsius.\n\n"
+                       "Examples:\n"
+                       "- location='Kota Bharu'\n"
+                       "- location='Langkawi', limit=14\n"
+                       "- no arguments -> a cross-section of locations nationwide",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "location": {"type": "string", "description": "Optional location name filter"},
-                "limit": {"type": "integer", "description": "Max records (default 200)"},
+                "location": {
+                    "type": "string", "minLength": 2, "maxLength": 64,
+                    "description": "Location name, case-insensitive partial match "
+                                   "(e.g. 'Kota Bharu', 'Langkawi', 'Kuala Lumpur'). "
+                                   "Omit for all locations.",
+                },
+                "limit": _limit(50, 200, "forecast records"),
             },
+            "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_weather_warning",
-        "description": "Active weather warnings for Malaysia (MET Malaysia).",
-        "inputSchema": {"type": "object", "properties": {}},
-
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "description": "Active weather warnings for Malaysia (MET Malaysia): heavy rain, "
+                       "strong wind and rough sea warnings currently in force, with the "
+                       "affected states and validity period. Takes no arguments.",
+        "inputSchema": {"type": "object", "properties": {},
+                        "additionalProperties": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_data_catalogue",
-        "description": "Query the Data Catalogue API (general gov datasets). Known ids: "
-                       "fuelprice (RON95/RON97/diesel weekly). Filters use value@column syntax, "
-                       "e.g. {'filter': 'level@series_type'} or {'sort': '-date'}.",
+        "description": "Query the data.gov.my Data Catalogue (general government "
+                       "datasets). Filters use data.gov.my's value@column syntax.\n\n"
+                       "Examples:\n"
+                       "- dataset_id='fuelprice', sort='-date', limit=5 "
+                       "-> latest weekly RON95/RON97/diesel prices\n"
+                       "- dataset_id='fuelprice', filter='level@series_type'\n"
+                       "- dataset_id='fuelprice', date_start='2026-01-01@date'\n\n"
+                       "Dataset ids come from https://data.gov.my/data-catalogue; "
+                       "an unknown id returns NOT_FOUND.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "dataset_id": {"type": "string", "description": "Dataset id, e.g. fuelprice"},
-                "limit": {"type": "integer", "description": "Max records (default 100)"},
-                "filter": {"type": "string", "description": "value@column exact match"},
-                "contains": {"type": "string", "description": "value@column partial match"},
-                "sort": {"type": "string", "description": "column or -column"},
-                "date_start": {"type": "string", "description": "YYYY-MM-DD@date"},
-                "date_end": {"type": "string", "description": "YYYY-MM-DD@date"},
+                "dataset_id": {
+                    "type": "string", "pattern": "^[a-z0-9_-]{2,64}$",
+                    "description": "Dataset id, e.g. 'fuelprice'.",
+                },
+                "limit": _limit(50, 500, "records"),
+                "filter": {"type": "string",
+                           "description": "Exact match as value@column, e.g. 'level@series_type'."},
+                "contains": {"type": "string",
+                             "description": "Partial match as value@column."},
+                "sort": {"type": "string",
+                         "description": "Column name, or -column for descending, e.g. '-date'."},
+                "date_start": {"type": "string",
+                               "description": "Inclusive start as YYYY-MM-DD@column, e.g. '2026-01-01@date'."},
+                "date_end": {"type": "string",
+                             "description": "Inclusive end as YYYY-MM-DD@column."},
             },
+            "required": ["dataset_id"],
+            "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_opendosm",
-        "description": "Query the OpenDOSM API (DOSM economics/statistics). Known ids: "
-                       "cpi_core (CPI index). Supports same filters as data catalogue.",
+        "description": "Query OpenDOSM (Department of Statistics Malaysia economic and "
+                       "social statistics). Same value@column filter syntax as the data "
+                       "catalogue.\n\n"
+                       "Examples:\n"
+                       "- dataset_id='cpi_core', sort='-date', limit=12 "
+                       "-> last 12 months of the core CPI index\n"
+                       "- dataset_id='cpi_core', date_start='2025-01-01@date'\n\n"
+                       "Dataset ids come from https://open.dosm.gov.my/data-catalogue.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "dataset_id": {"type": "string", "description": "Dataset id, e.g. cpi_core"},
-                "limit": {"type": "integer", "description": "Max records (default 100)"},
-                "filter": {"type": "string", "description": "value@column exact match"},
-                "sort": {"type": "string", "description": "column or -column"},
-                "date_start": {"type": "string", "description": "YYYY-MM-DD@date"},
-                "date_end": {"type": "string", "description": "YYYY-MM-DD@date"},
+                "dataset_id": {
+                    "type": "string", "pattern": "^[a-z0-9_-]{2,64}$",
+                    "description": "Dataset id, e.g. 'cpi_core'.",
+                },
+                "limit": _limit(50, 500, "records"),
+                "filter": {"type": "string",
+                           "description": "Exact match as value@column."},
+                "sort": {"type": "string",
+                         "description": "Column name, or -column for descending, e.g. '-date'."},
+                "date_start": {"type": "string",
+                               "description": "Inclusive start as YYYY-MM-DD@column."},
+                "date_end": {"type": "string",
+                             "description": "Inclusive end as YYYY-MM-DD@column."},
             },
+            "required": ["dataset_id"],
+            "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_gtfs_static_summary",
-        "description": "Download a GTFS static schedule ZIP (ktmb, prasarana, mybas-kota-bharu, "
-                       "mybas-alor-setar, mybas-kuala-terengganu, mybas-johor-bahru, etc.) and "
-                       "return file list, row counts, and sample routes.",
+        "description": "Summarize an agency's GTFS static schedule feed: file list, row "
+                       "counts for routes/stops/trips, and a few sample routes. Use this "
+                       "to discover what a network publishes before querying live "
+                       "positions.\n\n"
+                       "Examples:\n"
+                       "- agency='ktmb' -> KTM Berhad intercity/Komuter schedule\n"
+                       "- agency='prasarana' -> Rapid KL bus schedule",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "agency": {"type": "string", "description": "e.g. ktmb, prasarana, mybas-kota-bharu"},
+                "agency": {
+                    "type": "string",
+                    "enum": ["ktmb", "prasarana", "mybas-johor-bahru",
+                             "mybas-kota-bharu", "mybas-alor-setar",
+                             "mybas-kuala-terengganu"],
+                    "default": "ktmb",
+                    "description": "Transit agency feed to summarize.",
+                },
             },
+            "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_gtfs_realtime",
-        "description": "Live vehicle positions (GTFS-realtime protobuf). Agencies: ktmb, "
-                       "prasarana (category rapid-bus-kl / rapid-rail-kl), mybas-*. "
-                       "Returns count + vehicle id/lat/lon list. NOTE: the prasarana "
-                       "GTFS-RT feed is often empty - use mygov_rapid_bus_live for "
-                       "actual Rapid KL bus positions.",
+        "description": "Live vehicle positions from the data.gov.my GTFS-realtime feed. "
+                       "Returns the live vehicle count plus id/lat/lon/bearing/speed for "
+                       "up to `limit` vehicles.\n\n"
+                       "Examples:\n"
+                       "- agency='ktmb' -> live KTM trains\n"
+                       "- agency='prasarana', category='rapid-rail-kl' -> LRT/MRT trains\n\n"
+                       "NOTE: the prasarana rapid-bus-kl feed here is frequently empty — "
+                       "use mygov_rapid_bus_live for actual Rapid bus positions.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "agency": {"type": "string", "description": "ktmb, prasarana, or mybas-*"},
-                "category": {"type": "string", "description": "For prasarana: rapid-bus-kl, rapid-rail-kl, ..."},
+                "agency": {
+                    "type": "string",
+                    "enum": ["ktmb", "prasarana", "mybas-johor-bahru"],
+                    "default": "ktmb",
+                    "description": "Transit agency.",
+                },
+                "category": {
+                    "type": "string",
+                    "enum": ["rapid-bus-kl", "rapid-rail-kl", "rapid-bus-penang",
+                             "rapid-bus-kuantan", "rapid-bus-mrtfeeder"],
+                    "description": "Required for agency='prasarana'; ignored otherwise.",
+                },
+                "limit": _limit(50, 500, "vehicles"),
             },
+            "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_rapid_bus_live",
-        "description": "Live Rapid KL / Rapid Penang / Rapid Kuantan bus positions from the "
-                       "official myrapidbus kiosk feed (800+ buses). Providers: RKL (Klang "
-                       "Valley), RPG (Penang), RKN (Kuantan). Optional route filter "
-                       "(e.g. T2000, 300). Returns bus_no, lat/lon, route, speed, direction, "
-                       "last GPS time.",
+        "description": "Live Rapid bus positions from the official myrapidbus kiosk AVL "
+                       "feed (800+ buses in the Klang Valley alone). Returns bus_no, "
+                       "latitude/longitude, route, direction, speed and last GPS time.\n\n"
+                       "Examples:\n"
+                       "- provider='RKL', route='T200' -> just that route's buses\n"
+                       "- provider='RPG' -> Rapid Penang, first 50 buses\n\n"
+                       "Always pass `route` when asking about a specific service — the "
+                       "unfiltered fleet is large and gets truncated to `limit`.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "provider": {"type": "string", "description": "RKL, RPG, or RKN (default RKL)"},
-                "route": {"type": "string", "description": "Optional route number filter"},
+                "provider": {
+                    "type": "string", "enum": ["RKL", "RPG", "RKN"], "default": "RKL",
+                    "description": "RKL = Rapid KL (Klang Valley), RPG = Rapid Penang, "
+                                   "RKN = Rapid Kuantan.",
+                },
+                "route": {
+                    "type": "string", "pattern": "^[A-Za-z0-9-]{1,16}$",
+                    "description": "Route number filter, e.g. 'T200', '300'. Omit for the whole fleet.",
+                },
+                "limit": _limit(50, 500, "buses"),
             },
+            "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_flood_risk",
         "description": "Live flood risk from JPS (Department of Irrigation and Drainage) "
-                       "water-level telemetry. Returns stations currently at "
-                       "danger/warning/alert (only gauges that reported within the last "
-                       "24h - dead gauges excluded), each with name, state, district, "
-                       "lat/lon, water level, danger threshold, trend and last reading "
-                       "time, plus a per-state count summary.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-        },
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+                       "water-level telemetry. Returns every station currently at "
+                       "danger/warning/alert — name, state, district, latitude/longitude, "
+                       "water level and danger threshold in metres, trend and last reading "
+                       "time — plus a per-state count. Gauges that have not reported in 24h "
+                       "are excluded. Takes no arguments.",
+        "inputSchema": {"type": "object", "properties": {},
+                        "additionalProperties": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_pricecatcher",
-        "description": "Malaysia grocery price index (KPDN PriceCatcher, 198-item "
-                       "basket). Search items by name (e.g. TOMATO, RICE, ONION) or "
-                       "filter by group (BARANGAN SEGAR, MAKANAN KERING, MINUMAN...). "
-                       "Returns each item's current price, unit, month-on-month and "
-                       "year-on-year change, plus the 13-month price history. Updated "
-                       "daily by the dashboard's PriceCatcher collector.",
+        "description": "Malaysian grocery prices from the KPDN PriceCatcher 198-item "
+                       "basket. Returns each item's latest price in MYR, its unit, "
+                       "month-on-month and year-on-year change, and a 13-month price "
+                       "history.\n\n"
+                       "Examples:\n"
+                       "- item='TOMATO'\n"
+                       "- item='BERAS' (rice)\n"
+                       "- group='BARANGAN SEGAR', limit=30 (fresh produce)",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "item": {"type": "string", "description": "Item name substring search (case-insensitive)"},
-                "group": {"type": "string", "description": "Optional item group filter, e.g. BARANGAN SEGAR"},
-                "limit": {"type": "integer", "description": "Max items to return (default 20, max 1000)"},
+                "item": {
+                    "type": "string", "minLength": 2, "maxLength": 64,
+                    "description": "Item name substring, case-insensitive (e.g. 'TOMATO', 'AYAM', 'BERAS').",
+                },
+                "group": {
+                    "type": "string",
+                    "enum": ["BARANGAN SEGAR", "BARANGAN BERBUNGKUS",
+                             "MAKANAN KERING", "MINUMAN", "BARANGAN LAIN"],
+                    "description": "Item group filter.",
+                },
+                "limit": _limit(20, 200, "items"),
             },
+            "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_tourism_arrivals",
-        "description": "Malaysia monthly international visitor arrivals by country "
-                       "of nationality (Tourism Malaysia, top 51). Returns the "
-                       "month's total, month-on-month and year-on-year growth vs "
-                       "2025 and 2019, plus the year-to-date picture. Optional "
-                       "country filter (e.g. SINGAPORE, CHINA) and limit. Data "
-                       "updates monthly (~1 month lag); use for tourism demand, "
-                       "recovery vs pre-pandemic 2019, and top source markets.",
+        "description": "Malaysian monthly international visitor arrivals by country of "
+                       "nationality (Tourism Malaysia, top 51 markets). Returns the "
+                       "month's arrivals, month-on-month and year-on-year growth, "
+                       "recovery vs pre-pandemic 2019, and the year-to-date picture. "
+                       "Published monthly with roughly a one-month lag — check "
+                       "meta.data_period before describing it as current.\n\n"
+                       "Examples:\n"
+                       "- country='SINGAPORE'\n"
+                       "- limit=10 -> the ten largest source markets",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "country": {"type": "string", "description": "Country/nationality filter, case-insensitive substring (e.g. SINGAPORE, CHINA, INDIA)"},
-                "limit": {"type": "integer", "description": "Max countries to return (default 10, max 100)"},
+                "country": {
+                    "type": "string", "minLength": 2, "maxLength": 64,
+                    "description": "Country/nationality substring, case-insensitive "
+                                   "(e.g. 'SINGAPORE', 'CHINA', 'INDIA').",
+                },
+                "limit": _limit(10, 60, "countries"),
             },
+            "additionalProperties": False,
         },
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_rapid_service_alert",
-        "description": "Latest Rapid KL service alert (LRT/MRT/monorail/bus disruption, myrapid.com.my "
-                       "PULSE). Returns the newest post only: title, excerpt, link, posted time. "
-                       "Source is behind Incapsula; collected via the dashboard every 10 min.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "description": "Latest Rapid KL service alert (LRT/MRT/monorail/bus disruption) "
+                       "from myrapid.com.my PULSE. Returns the newest post only: title, "
+                       "excerpt, link and posted time. Refreshed about every 10 minutes. "
+                       "Takes no arguments.",
+        "inputSchema": {"type": "object", "properties": {},
+                        "additionalProperties": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_air_quality",
-        "description": "Live air quality index (US AQI) for 18 major Malaysian cities "
-                       "(Open-Meteo hourly model). Returns every city's AQI and PM2.5 sorted "
-                       "worst-first, plus the cleanest station for comparison. US AQI 101+ "
-                       "(Unhealthy) is the haze alert threshold.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "description": "Live air quality for 18 major Malaysian cities on the US AQI "
+                       "scale, with PM2.5 in micrograms per cubic metre. Stations are "
+                       "sorted worst-first and the cleanest is included for comparison. "
+                       "US AQI 101+ (Unhealthy) is the haze alert threshold. Takes no "
+                       "arguments.",
+        "inputSchema": {"type": "object", "properties": {},
+                        "additionalProperties": False},
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_hotel_performance",
         "description": "Quarterly hotel performance by state from Tourism Malaysia's Paid "
-                       "Accommodation Survey (via the dashboard): occupancy rate (AOR), "
-                       "average room rate (ARR) and hotel guests (domestic/international) "
-                       "for all 16 states, current quarter vs a year earlier. Optional "
-                       "state filter (e.g. 'Pahang'). Only the latest quarter is public "
-                       "on the source portal.",
-        "inputSchema": {"type": "object", "properties": {
-            "state": {"type": "string", "description": "Optional state name filter, e.g. 'Pahang' or 'Kuala Lumpur'"},
-        }},
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+                       "Accommodation Survey: occupancy rate (percent), average room rate "
+                       "(MYR per room-night) and hotel guests (domestic/international) for "
+                       "all 16 states, current quarter vs a year earlier. Only the latest "
+                       "quarter is published — see meta.data_period.\n\n"
+                       "Examples:\n"
+                       "- state='Pahang'\n"
+                       "- no arguments -> all states",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "state": {
+                    "type": "string", "minLength": 3, "maxLength": 32,
+                    "description": "State name, e.g. 'Pahang', 'Kuala Lumpur', 'Sabah'. "
+                                   "Omit for all 16 states.",
+                },
+            },
+            "additionalProperties": False,
+        },
+        "annotations": READ_ONLY,
     },
     {
         "name": "mygov_election_results",
-        "description": "Latest election results from SPR (Suruhanjaya Pilihan Raya): "
-                       "PRU-15 parliamentary (208 seats), the latest state election for "
-                       "every state (600 DUN seats) or the latest by-election. Optional "
-                       "category (pru/dun/prk), state (e.g. 'KEDAH') and free-text query "
-                       "matched against constituency, winner or party name. Results are "
-                       "static once published.",
-        "inputSchema": {"type": "object", "properties": {
-            "category": {"type": "string", "description": "pru, dun or prk"},
-            "state": {"type": "string", "description": "State name filter, e.g. 'KEDAH'"},
-            "query": {"type": "string", "description": "Free text: constituency, winner or party"},
-        }},
-        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+        "description": "Election results from SPR (Suruhanjaya Pilihan Raya): PRU-15 "
+                       "parliamentary seats, the latest state election for every state, "
+                       "or the latest by-election. Returns constituency, winner, party, "
+                       "votes and majority. Results are static once published.\n\n"
+                       "Examples:\n"
+                       "- category='pru', state='KEDAH'\n"
+                       "- query='Anwar' -> seats won by a matching candidate\n"
+                       "- category='prk' -> the most recent by-election",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "category": {
+                    "type": "string", "enum": ["pru", "dun", "prk"],
+                    "description": "pru = parliamentary (208 seats), dun = state assembly "
+                                   "(600 seats across 13 states), prk = by-election.",
+                },
+                "state": {
+                    "type": "string", "minLength": 3, "maxLength": 32,
+                    "description": "State name, e.g. 'KEDAH' (matched case-insensitively).",
+                },
+                "query": {
+                    "type": "string", "minLength": 2, "maxLength": 64,
+                    "description": "Free text matched against constituency, winner or party name.",
+                },
+                "limit": _limit(50, 800, "seats"),
+            },
+            "additionalProperties": False,
+        },
+        "annotations": READ_ONLY,
     },
 ]
 
@@ -746,57 +1075,140 @@ def rpc_error(id_, code, message):
     return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": message}}
 
 
+TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
+
+
+def _schema(tool, prop):
+    return TOOLS_BY_NAME[tool]["inputSchema"]["properties"].get(prop, {})
+
+
+def limit_arg(tool, args):
+    """Resolve `limit` against the tool's own schema.
+
+    The schema advertises the bounds so the model asks for something sensible;
+    this clamp enforces them, because a schema is guidance and a client may
+    ignore it entirely.
+    """
+    spec = _schema(tool, "limit")
+    default = spec.get("default", 50)
+    lo, hi = spec.get("minimum", 1), spec.get("maximum", 500)
+    raw = args.get("limit")
+    if raw is None or raw == "":
+        return default
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise invalid("limit must be an integer", limit=raw,
+                      minimum=lo, maximum=hi, default=default)
+    return max(lo, min(n, hi))
+
+
+def enum_arg(tool, prop, args, default=None, upper=False):
+    """Validate an enum-constrained string, echoing the allowed values back."""
+    raw = args.get(prop)
+    if raw is None or raw == "":
+        return default
+    val = str(raw).strip()
+    if upper:
+        val = val.upper()
+    allowed = _schema(tool, prop).get("enum")
+    if allowed and val not in allowed:
+        raise invalid(f"{prop} must be one of: {', '.join(allowed)}",
+                      **{prop: raw, "allowed": allowed})
+    return val
+
+
+def str_arg(args, prop, default=""):
+    raw = args.get(prop)
+    return default if raw is None else str(raw).strip()
+
+
 def call_tool(name, args):
     a = args or {}
-    # Clamp client-supplied limits - an arbitrary huge value would force a
-    # giant upstream fetch.
-    def _clamp(v, default):
-        try:
-            n = int(v)
-        except (TypeError, ValueError):
-            return default
-        return max(1, min(n, 1000))
+    if name not in TOOLS_BY_NAME:
+        raise ToolError("NOT_FOUND", f"unknown tool: {name}",
+                        details={"available": sorted(TOOLS_BY_NAME)})
+
     if name == "mygov_weather_forecast":
-        return get_weather_forecast(a.get("location"))
+        data = get_weather_forecast(str_arg(a, "location") or None,
+                                    limit_arg(name, a))
+        return envelope(name, data)
+
     if name == "mygov_weather_warning":
-        return get_weather_warning()
-    if name == "mygov_data_catalogue":
-        filters = {k: v for k, v in a.items()
-                   if k in ("filter", "contains", "sort", "date_start", "date_end") and v}
-        return get_data_catalogue(a.get("dataset_id", ""), _clamp(a.get("limit"), 100), filters)
-    if name == "mygov_opendosm":
-        filters = {k: v for k, v in a.items()
-                   if k in ("filter", "sort", "date_start", "date_end") and v}
-        return get_opendosm(a.get("dataset_id", ""), _clamp(a.get("limit"), 100), filters)
+        return envelope(name, get_weather_warning())
+
+    if name in ("mygov_data_catalogue", "mygov_opendosm"):
+        dataset_id = str_arg(a, "dataset_id")
+        if not re.match(r"^[a-z0-9_-]{2,64}$", dataset_id):
+            raise invalid("dataset_id is required and must be a dataset slug "
+                          "(lowercase letters, digits, _ or -)",
+                          dataset_id=a.get("dataset_id"))
+        keys = ("filter", "contains", "sort", "date_start", "date_end")
+        filters = {k: v for k, v in a.items() if k in keys and v}
+        fetch = (get_data_catalogue if name == "mygov_data_catalogue"
+                 else get_opendosm)
+        data = fetch(dataset_id, limit_arg(name, a), filters)
+        return envelope(name, data, dataset=dataset_id)
+
     if name == "mygov_gtfs_static_summary":
-        return get_gtfs_static_summary(a.get("agency", "ktmb"))
+        agency = enum_arg(name, "agency", a, default="ktmb")
+        return envelope(name, get_gtfs_static_summary(agency), dataset=agency)
+
     if name == "mygov_gtfs_realtime":
-        return get_gtfs_realtime(a.get("agency", "ktmb"), a.get("category"))
+        agency = enum_arg(name, "agency", a, default="ktmb")
+        category = enum_arg(name, "category", a)
+        if agency == "prasarana" and not category:
+            raise invalid("agency='prasarana' needs a category "
+                          "(e.g. rapid-rail-kl)",
+                          allowed=_schema(name, "category")["enum"])
+        data = get_gtfs_realtime(agency, category, limit_arg(name, a))
+        return envelope(name, data)
+
     if name == "mygov_rapid_bus_live":
-        provider = str(a.get("provider", "RKL")).upper()
-        if provider not in ("RKL", "RPG", "RKN"):
-            raise ValueError(f"unknown provider {provider} (use RKL, RPG, or RKN)")
-        route = str(a.get("route", ""))
+        provider = enum_arg(name, "provider", a, default="RKL", upper=True)
+        route = str_arg(a, "route")
         if route and not re.match(r"^[A-Za-z0-9-]{1,16}$", route):
-            raise ValueError("invalid route")
-        return get_rapid_bus_live(provider, route)
+            raise invalid("route must be 1-16 letters, digits or hyphens "
+                          "(e.g. 'T200', '300')", route=route)
+        data = get_rapid_bus_live(provider, route, limit_arg(name, a))
+        return envelope(name, data)
+
     if name == "mygov_flood_risk":
-        return get_flood_risk()
+        data = get_flood_risk()
+        return envelope(name, data, data_updated_at=data.get("updated"))
+
     if name == "mygov_pricecatcher":
-        return get_pricecatcher(a.get("item", ""), a.get("group", ""),
-                                a.get("limit", 20))
+        data = get_pricecatcher(str_arg(a, "item"),
+                                enum_arg(name, "group", a, default="") or "",
+                                limit_arg(name, a))
+        return envelope(name, data, data_period=data.get("as_of"),
+                        data_updated_at=data.get("generated"))
+
     if name == "mygov_tourism_arrivals":
-        return get_tourism(a.get("country", ""), a.get("limit", 10))
+        data = get_tourism(str_arg(a, "country"), limit_arg(name, a))
+        return envelope(name, data, data_period=data.get("as_of"),
+                        data_updated_at=data.get("generated"))
+
     if name == "mygov_rapid_service_alert":
-        return get_rapid_service_alert()
+        data = get_rapid_service_alert()
+        return envelope(name, data, data_updated_at=data.get("updated"))
+
     if name == "mygov_air_quality":
-        return get_air_quality()
+        data = get_air_quality()
+        return envelope(name, data, data_period=data.get("reading_time"),
+                        data_updated_at=data.get("updated"))
+
     if name == "mygov_hotel_performance":
-        return get_hotel_performance(a.get("state", ""))
+        data = get_hotel_performance(str_arg(a, "state"))
+        return envelope(name, data, data_period=data.get("asOf"),
+                        data_updated_at=data.get("generated"))
+
     if name == "mygov_election_results":
-        return get_election_results(a.get("category", ""), a.get("state", ""),
-                                    a.get("query", ""))
-    raise ValueError(f"Unknown tool: {name}")
+        data = get_election_results(str_arg(a, "category"), str_arg(a, "state"),
+                                    str_arg(a, "query"), limit_arg(name, a))
+        return envelope(name, data, data_updated_at=data.get("generated"))
+
+    raise ToolError("INTERNAL_ERROR", f"tool {name} is declared but not wired up")
 
 
 def main():
@@ -830,16 +1242,31 @@ def main():
             args = params.get("arguments", {})
             try:
                 result = call_tool(name, args)
-                content = [{"type": "text", "text": json.dumps(result, ensure_ascii=False, default=str)}]
-                sys.stdout.write(json.dumps(rpc_response(mid, {
-                    "content": content,
-                    "isError": False,
-                })) + "\n")
-            except Exception as e:
-                sys.stdout.write(json.dumps(rpc_error(mid, -32000, f"{type(e).__name__}: {e}")) + "\n")
+                payload, is_error = result, False
+            except ToolError as e:
+                payload, is_error = e.to_dict(), True
+            except Exception as e:  # nothing should reach here; report it cleanly
+                payload = ToolError("INTERNAL_ERROR",
+                                    f"{type(e).__name__}: {e}").to_dict()
+                is_error = True
+            # Tool failures come back as an isError result rather than a
+            # JSON-RPC error so the calling model can read the code and decide
+            # whether to retry, fix its arguments, or give up.
+            content = [{"type": "text",
+                        "text": json.dumps(payload, ensure_ascii=False, default=str)}]
+            sys.stdout.write(json.dumps(rpc_response(mid, {
+                "content": content,
+                "isError": is_error,
+            })) + "\n")
             sys.stdout.flush()
         elif method == "ping":
             sys.stdout.write(json.dumps(rpc_response(mid, {})) + "\n")
+            sys.stdout.flush()
+        elif mid is not None:
+            # Unknown request (as opposed to a notification): answer with the
+            # standard JSON-RPC code instead of leaving the client hanging.
+            sys.stdout.write(json.dumps(rpc_error(
+                mid, -32601, f"method not found: {method}")) + "\n")
             sys.stdout.flush()
 
 
