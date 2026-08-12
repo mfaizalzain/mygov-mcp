@@ -3,6 +3,17 @@
 Bundles the mygov MCP server (api.data.gov.my) for Claude Code. Ships the server
 dependency-free (stdlib only) and a `mygov-data` skill.
 
+## Tools (14)
+
+`mygov_weather_forecast`, `mygov_weather_warning`, `mygov_data_catalogue`,
+`mygov_opendosm`, `mygov_gtfs_static_summary`, `mygov_gtfs_realtime`,
+`mygov_rapid_bus_live`, `mygov_flood_risk`, `mygov_pricecatcher`,
+`mygov_tourism_arrivals`, `mygov_rapid_service_alert`, `mygov_air_quality`,
+`mygov_hotel_performance` (quarterly hotel occupancy/room rate/guests by
+state, Tourism Malaysia), `mygov_election_results` (latest SPR election
+results: PRU-15, state elections for all 13 states, latest by-election —
+filter by category/state/search).
+
 ## Local testing
 
 ```bash

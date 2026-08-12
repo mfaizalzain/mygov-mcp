@@ -16,6 +16,13 @@ Use the `mygov_*` MCP tools to query live Malaysian government open data. No API
 - `mygov_gtfs_static_summary` — GTFS schedule ZIP summary: agencies ktmb, prasarana, mybas-kota-bharu, mybas-alor-setar, mybas-kuala-terengganu, mybas-johor-bahru.
 - `mygov_gtfs_realtime` — live vehicles from GTFS-RT: ktmb, prasarana (category rapid-bus-kl / rapid-rail-kl), mybas-*. NOTE: the prasarana GTFS-RT feed is often empty.
 - `mygov_rapid_bus_live` — **actual** live Rapid KL/Penang/Kuantan bus positions from the official myrapidbus kiosk feed (800+ buses). Providers: RKL (Klang Valley), RPG (Penang), RKN (Kuantan). Optional route filter. Use this instead of mygov_gtfs_realtime for Rapid buses.
+- `mygov_flood_risk` — flood risk by area (based on Malaysia's flood danger alerts).
+- `mygov_pricecatcher` — item price comparison (PriceCatcher): cheapest/most expensive districts for an item, optional item/group filter.
+- `mygov_tourism_arrivals` — monthly international visitor arrivals by country of nationality (Tourism Malaysia), optional country filter.
+- `mygov_rapid_service_alert` — latest Rapid KL service alert (myrapid.com.my PULSE): title, excerpt, link, posted time.
+- `mygov_air_quality` — live US AQI for 18 major Malaysian cities (Open-Meteo), worst-first + cleanest. 101+ (Unhealthy) = haze alert threshold.
+- `mygov_hotel_performance` — quarterly hotel performance by state (Tourism Malaysia Paid Accommodation Survey): occupancy rate, average room rate, guests (domestic/international), current quarter vs a year earlier. Optional `state` filter.
+- `mygov_election_results` — latest SPR election results: PRU-15 parliamentary (208 seats), latest state election for every state (600 DUN seats), latest by-election. Filter by `category` (pru/dun/prk), `state`, or free-text `query` (constituency/winner/party).
 
 ## Query syntax
 

@@ -456,6 +456,87 @@ def get_air_quality():
     }
 
 
+def get_hotel_performance(state=""):
+    """Quarterly hotel performance by state (Tourism Malaysia Paid
+    Accommodation Survey, via the dashboard's hotel.json).
+
+    Occupancy rate (AOR), average room rate (ARR) and hotel guests
+    (domestic/international) for all 16 states, current quarter vs a year
+    earlier. Only the latest quarter is public on the source portal, so the
+    dashboard collector probes newest-first; this returns the current quarter.
+    """
+    req = urllib.request.Request(
+        "https://malaysia-at-a-glance.com/hotel.json",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    out = {"asOf": data.get("asOf"), "generated": data.get("generated"),
+           "source": data.get("source")}
+    if state:
+        state = state.strip().title()
+    for key, label in (("aor", "occupancy_rate"), ("arr", "average_room_rate"),
+                       ("guests", "guests")):
+        rows = data.get(key) or []
+        if state:
+            rows = [x for x in rows if str(x.get("state", "")).strip().title() == state]
+        out[label] = rows
+    return out
+
+
+def get_election_results(category="", state="", query=""):
+    """Latest election results from SPR (Suruhanjaya Pilihan Raya), via the
+    dashboard's election.json.
+
+    Categories: pru (PRU-15 parliamentary, 208 seats), dun (latest state
+    election for every state - 600 seats across all 13 states) or prk (latest
+    by-election). Optional state filter (e.g. 'KEDAH') and free-text query
+    matched against constituency, winner or party name. Results are static
+    once published - this is a one-time crawl per election.
+    """
+    req = urllib.request.Request(
+        "https://malaysia-at-a-glance.com/election.json",
+        headers={"User-Agent": "mygov-mcp/1.0 (+https://malaysia-at-a-glance.com)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    seats = data.get("seats") or []
+    if category:
+        category = category.strip().lower()
+        if category not in ("pru", "dun", "prk"):
+            raise ValueError("category must be pru, dun or prk")
+        seats = [s for s in seats if s.get("category") == category]
+    if state:
+        state = state.strip().upper()
+        seats = [s for s in seats if str(s.get("state", "")).upper() == state]
+    if query:
+        q = query.strip().lower()
+        if q:
+            def _matches(s):
+                w = next((c for c in (s.get("candidates") or []) if c.get("isWinner")), None)
+                hay = " ".join(str(x) for x in
+                               [s.get("name"), s.get("state"), s.get("election"),
+                                w.get("name") if w else "",
+                                (w.get("partyShort") or w.get("party")) if w else ""]).lower()
+                return q in hay
+            seats = [s for s in seats if _matches(s)]
+    # compact per-seat view - candidates are the heavy part
+    def _compact(s):
+        w = next((c for c in (s.get("candidates") or []) if c.get("isWinner")), None)
+        return {
+            "category": s.get("category"), "state": s.get("state"),
+            "name": s.get("name"), "election": s.get("election"),
+            "date": s.get("date"),
+            "winner": w.get("name") if w else None,
+            "party": (w.get("partyShort") or w.get("party")) if w else None,
+            "votes": w.get("votes") if w else None,
+            "majority": s.get("majority"), "totalVotes": s.get("totalVotes"),
+        }
+    out = {"generated": data.get("generated"), "source": data.get("source"),
+           "note": data.get("note"),
+           "categories": {k: (v or {}).get("name") for k, v in (data.get("categories") or {}).items()},
+           "count": len(seats), "seats": [_compact(s) for s in seats]}
+    return out
+
+
 TOOLS = [
     {
         "name": "mygov_weather_forecast",
@@ -626,6 +707,34 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
         "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
     },
+    {
+        "name": "mygov_hotel_performance",
+        "description": "Quarterly hotel performance by state from Tourism Malaysia's Paid "
+                       "Accommodation Survey (via the dashboard): occupancy rate (AOR), "
+                       "average room rate (ARR) and hotel guests (domestic/international) "
+                       "for all 16 states, current quarter vs a year earlier. Optional "
+                       "state filter (e.g. 'Pahang'). Only the latest quarter is public "
+                       "on the source portal.",
+        "inputSchema": {"type": "object", "properties": {
+            "state": {"type": "string", "description": "Optional state name filter, e.g. 'Pahang' or 'Kuala Lumpur'"},
+        }},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+    },
+    {
+        "name": "mygov_election_results",
+        "description": "Latest election results from SPR (Suruhanjaya Pilihan Raya): "
+                       "PRU-15 parliamentary (208 seats), the latest state election for "
+                       "every state (600 DUN seats) or the latest by-election. Optional "
+                       "category (pru/dun/prk), state (e.g. 'KEDAH') and free-text query "
+                       "matched against constituency, winner or party name. Results are "
+                       "static once published.",
+        "inputSchema": {"type": "object", "properties": {
+            "category": {"type": "string", "description": "pru, dun or prk"},
+            "state": {"type": "string", "description": "State name filter, e.g. 'KEDAH'"},
+            "query": {"type": "string", "description": "Free text: constituency, winner or party"},
+        }},
+        "annotations": {"readOnlyHint": True, "openWorldHint": False, "destructiveHint": False},
+    },
 ]
 
 
@@ -682,6 +791,11 @@ def call_tool(name, args):
         return get_rapid_service_alert()
     if name == "mygov_air_quality":
         return get_air_quality()
+    if name == "mygov_hotel_performance":
+        return get_hotel_performance(a.get("state", ""))
+    if name == "mygov_election_results":
+        return get_election_results(a.get("category", ""), a.get("state", ""),
+                                    a.get("query", ""))
     raise ValueError(f"Unknown tool: {name}")
 
 

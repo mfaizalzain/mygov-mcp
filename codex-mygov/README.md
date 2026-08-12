@@ -3,6 +3,17 @@
 Bundles the mygov MCP server (api.data.gov.my) for Codex CLI and ChatGPT Work.
 Ships the server dependency-free (stdlib only) and a `mygov-data` skill.
 
+## Tools (14)
+
+`mygov_weather_forecast`, `mygov_weather_warning`, `mygov_data_catalogue`,
+`mygov_opendosm`, `mygov_gtfs_static_summary`, `mygov_gtfs_realtime`,
+`mygov_rapid_bus_live`, `mygov_flood_risk`, `mygov_pricecatcher`,
+`mygov_tourism_arrivals`, `mygov_rapid_service_alert`, `mygov_air_quality`,
+`mygov_hotel_performance` (quarterly hotel occupancy/room rate/guests by
+state, Tourism Malaysia), `mygov_election_results` (latest SPR election
+results: PRU-15, state elections for all 13 states, latest by-election —
+filter by category/state/search).
+
 ## Local testing (Codex CLI)
 
 ```bash
@@ -32,7 +43,7 @@ not enough for the public directory. You need:
    plus `Apps Management: Write` on your org role.
 4. Submit at **platform.openai.com/plugins** → Create plugin → With MCP:
    - Info tab: listing, logo, website/support/privacy/terms URLs
-   - MCP tab: server URL → **Scan Tools** → review 6 tools (all `readOnlyHint: true`)
+   - MCP tab: server URL → **Scan Tools** → review 14 tools (all `readOnlyHint: true`)
    - Prompts: 3+ starter prompts; Testing: 5 positive + 3 negative test cases
    - Global: country availability; Submit: release notes + attestations
 5. Approve → you choose when to publish → appears in the universal Plugins
