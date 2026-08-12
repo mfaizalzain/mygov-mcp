@@ -8,10 +8,14 @@ Claude Code via:  claude mcp add -s user mygov -- python3 <this file>
 API reference: https://developer.data.gov.my  (base: https://api.data.gov.my)
 Rate limit: 4 req/min per API family — the server keeps a per-family throttle.
 """
+import base64
+import binascii
+import hashlib
 import json
 import re
 import socket
 import sys
+import threading
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -23,7 +27,8 @@ from collections import defaultdict
 
 BASE = "https://api.data.gov.my"
 DASH = "https://malaysia-at-a-glance.com"
-UA = "mygov-mcp/1.1 (+https://malaysia-at-a-glance.com)"
+SERVER_VERSION = "1.2.0"
+UA = f"mygov-mcp/{SERVER_VERSION} (+https://malaysia-at-a-glance.com)"
 
 
 # ---- structured tool errors ----
@@ -86,18 +91,110 @@ def _upstream_error(exc, url):
                      details={"url": url})
 
 
-def http_get(url, headers=None, timeout=30):
+# ---- response cache ----
+# Caching sits at the HTTP layer, keyed by URL, so every tool that reads the
+# same upstream file shares one entry and client-side filtering/paging never
+# re-fetches. It protects the upstream government services as much as us.
+class TTLCache:
+    def __init__(self, max_entries=128):
+        self._lock = threading.Lock()
+        self._store = {}
+        self._max = max_entries
+
+    def get(self, key):
+        """Return (value, age_seconds) if a live entry exists, else None."""
+        now = time.time()
+        with self._lock:
+            hit = self._store.get(key)
+            if not hit:
+                return None
+            value, stored_at, ttl = hit
+            if now - stored_at >= ttl:
+                del self._store[key]
+                return None
+            return value, int(now - stored_at)
+
+    def set(self, key, value, ttl):
+        with self._lock:
+            if len(self._store) >= self._max:
+                oldest = min(self._store, key=lambda k: self._store[k][1])
+                del self._store[oldest]
+            self._store[key] = (value, time.time(), ttl)
+
+    def stats(self):
+        now = time.time()
+        with self._lock:
+            return {"entries": len(self._store), "max_entries": self._max,
+                    "live": sum(1 for v in self._store.values()
+                                if now - v[1] < v[2])}
+
+
+CACHE = TTLCache()
+
+# How long each upstream stays fresh. Live vehicle feeds move constantly;
+# a quarterly survey does not.
+TTL = {
+    "rapid_bus": 90, "gtfs_realtime": 20, "flood": 120, "aqi": 600,
+    "weather": 600, "weather_warning": 300, "rapid_alert": 300,
+    "prices": 3600, "catalogue": 900, "tourism": 86400, "hotel": 86400,
+    "election": 86400, "gtfs_static": 86400,
+}
+
+# Per-tool-call record of whether the data came from cache, so meta.cache can
+# tell a client it is looking at a response that is a few seconds old.
+_TRACE = threading.local()
+
+
+def _trace_reset():
+    _TRACE.entries = []
+
+
+def _trace_add(status, age, ttl):
+    if getattr(_TRACE, "entries", None) is None:
+        _TRACE.entries = []
+    _TRACE.entries.append((status, age, ttl))
+
+
+def _trace_summary():
+    entries = getattr(_TRACE, "entries", None) or []
+    if not entries:
+        return None
+    age = max(e[1] for e in entries)
+    return {"status": "hit" if all(e[0] == "hit" for e in entries) else "miss",
+            "age_seconds": age, "ttl_seconds": min(e[2] for e in entries)}
+
+
+def cache_bucket(ttl):
+    """A cache-buster that only changes once per TTL window.
+
+    Some upstreams sit behind a CDN and need a changing query param, but a
+    per-request timestamp would make every response uncacheable for us too.
+    """
+    return int(time.time() // max(ttl, 1))
+
+
+def http_get(url, headers=None, timeout=30, ttl=0):
     """GET returning raw bytes, with upstream failures mapped to ToolError."""
+    if ttl:
+        cached = CACHE.get(url)
+        if cached is not None:
+            value, age = cached
+            _trace_add("hit", age, ttl)
+            return value
+        _trace_add("miss", 0, ttl)
     req = urllib.request.Request(url, headers=headers or {"User-Agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read(), r.headers
+            body, hdrs = r.read(), dict(r.headers)
     except (urllib.error.URLError, socket.timeout, OSError) as e:
         raise _upstream_error(e, url)
+    if ttl:
+        CACHE.set(url, (body, hdrs), ttl)
+    return body, hdrs
 
 
-def http_get_json(url, headers=None, timeout=30):
-    body, _ = http_get(url, headers, timeout)
+def http_get_json(url, headers=None, timeout=30, ttl=0):
+    body, _ = http_get(url, headers, timeout, ttl)
     try:
         return json.loads(body.decode("utf-8", "replace"))
     except json.JSONDecodeError as e:
@@ -105,6 +202,54 @@ def http_get_json(url, headers=None, timeout=30):
                         f"upstream returned a non-JSON body: {e}",
                         retryable=True, retry_after_seconds=30,
                         details={"url": url})
+
+
+# ---- cursor pagination ----
+# Cursors are opaque to the client but carry a fingerprint of the query, so a
+# cursor from a different search can be rejected instead of silently paging
+# through the wrong result set.
+def _fingerprint(parts):
+    raw = json.dumps(parts, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:8]
+
+
+def encode_cursor(offset, fingerprint):
+    raw = json.dumps({"o": offset, "f": fingerprint}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor, fingerprint):
+    pad = "=" * (-len(cursor) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor + pad))
+        offset = int(payload["o"])
+    except (ValueError, KeyError, TypeError, binascii.Error):
+        raise invalid("cursor is not a cursor issued by this server; omit it "
+                      "to start from the beginning", cursor=cursor)
+    if payload.get("f") != fingerprint:
+        raise invalid("cursor belongs to a different query — reissue it by "
+                      "repeating the request without a cursor", cursor=cursor)
+    return max(offset, 0)
+
+
+def paginate(items, limit, cursor, query):
+    """Slice `items` into a page and describe the rest.
+
+    `query` is whatever identifies this result set (the filter arguments);
+    it is fingerprinted into the cursor.
+    """
+    fp = _fingerprint(query)
+    offset = decode_cursor(cursor, fp) if cursor else 0
+    page = items[offset:offset + limit]
+    nxt = offset + len(page)
+    has_more = nxt < len(items)
+    return page, {
+        "total": len(items),
+        "returned": len(page),
+        "offset": offset,
+        "has_more": has_more,
+        "next_cursor": encode_cursor(nxt, fp) if has_more else None,
+    }
 
 
 # ---- provenance ----
@@ -129,6 +274,10 @@ SOURCES = {
     "mygov_opendosm": {
         "source": "Department of Statistics Malaysia (DOSM), OpenDOSM",
         "source_url": "https://api.data.gov.my/opendosm",
+        "freshness": "varies", "update_frequency": "per dataset"},
+    "mygov_dataset_info": {
+        "source": "data.gov.my / OpenDOSM catalogue metadata",
+        "source_url": "https://developer.data.gov.my",
         "freshness": "varies", "update_frequency": "per dataset"},
     "mygov_gtfs_static_summary": {
         "source": "data.gov.my GTFS static feeds",
@@ -198,6 +347,9 @@ def envelope(tool, data, data_period=None, data_updated_at=None, **extra):
     if data_updated_at is not None:
         meta["data_updated_at"] = data_updated_at
     meta.update({k: v for k, v in extra.items() if v is not None})
+    cache = _trace_summary()
+    if cache:
+        meta["cache"] = cache
     return {"data": data, "meta": meta}
 
 # ---- minimal GTFS-realtime protobuf wire parser (subset we need) ----
@@ -239,7 +391,7 @@ def _parse_feed_message(data):
     return vehicles
 
 def _parse_feed_entity(data):
-    ent = {"id": None, "lat": None, "lon": None, "timestamp": None}
+    ent = {"id": None, "latitude": None, "longitude": None, "timestamp": None}
     pos = 0
     n = len(data)
     while pos < n:
@@ -305,9 +457,9 @@ def _parse_position(data):
             val = struct.unpack("<f", data[pos:pos + 4])[0]
             pos += 4
             if field == 1:
-                p["lat"] = round(val, 6)
+                p["latitude"] = round(val, 6)
             elif field == 2:
-                p["lon"] = round(val, 6)
+                p["longitude"] = round(val, 6)
             elif field == 3:
                 p["bearing"] = round(val, 1)
             elif field == 5:
@@ -339,11 +491,16 @@ class Throttle:
 THROTTLE = Throttle()
 
 
-def api_get(path, params=None):
+def api_get(path, params=None, ttl=0, family=None):
     url = BASE + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    body, headers = http_get(url, headers={"User-Agent": "Mozilla/5.0 mygov-mcp"})
+    # Only spend rate-limit budget (and only sleep) when we are actually going
+    # to the network — a cache hit must not block.
+    if family and not (ttl and CACHE.get(url)):
+        THROTTLE.wait(family)
+    body, headers = http_get(url, headers={"User-Agent": "Mozilla/5.0 mygov-mcp"},
+                             ttl=ttl)
     ctype = headers.get("Content-Type", "")
     if "json" in ctype or path.startswith(("/data-catalogue", "/opendosm", "/weather")):
         try:
@@ -357,44 +514,46 @@ def api_get(path, params=None):
 
 
 def get_weather_forecast(location=None, limit=50):
-    THROTTLE.wait("weather")
     params = {"limit": limit}
     if location:
         params["contains"] = f"{location}@location__location_name"
-    return api_get("/weather/forecast", params)
+    return api_get("/weather/forecast", params, ttl=TTL["weather"],
+                   family="weather")
 
 
 def get_weather_warning():
-    THROTTLE.wait("weather")
-    return api_get("/weather/warning")
+    return api_get("/weather/warning", ttl=TTL["weather_warning"],
+                   family="weather")
 
 
-def get_data_catalogue(dataset_id, limit=100, filters=None):
-    THROTTLE.wait("data-catalogue")
+def get_data_catalogue(dataset_id, limit=100, filters=None, meta=True):
     params = {"id": dataset_id, "limit": limit}
+    if meta:
+        params["meta"] = "true"
     if filters:
         params.update(filters)
-    return api_get("/data-catalogue", params)
+    return api_get("/data-catalogue", params, ttl=TTL["catalogue"],
+                   family="data-catalogue")
 
 
-def get_opendosm(dataset_id, limit=100, filters=None):
-    THROTTLE.wait("opendosm")
+def get_opendosm(dataset_id, limit=100, filters=None, meta=True):
     params = {"id": dataset_id, "limit": limit}
+    if meta:
+        params["meta"] = "true"
     if filters:
         params.update(filters)
-    return api_get("/opendosm", params)
+    return api_get("/opendosm", params, ttl=TTL["catalogue"],
+                   family="opendosm")
 
 
 def get_gtfs_static_summary(agency):
     """Download GTFS static ZIP and summarize routes/stops/trips."""
-    THROTTLE.wait("gtfs")
     if not re.match(r"^[a-z0-9-]{1,32}$", agency):
         raise invalid("agency must be lowercase letters, digits or hyphens",
                       agency=agency)
-    if agency.startswith("prasarana"):
-        data = api_get(f"/gtfs-static/{agency}?category=rapid-bus-kl")
-    else:
-        data = api_get(f"/gtfs-static/{agency}")
+    suffix = "?category=rapid-bus-kl" if agency.startswith("prasarana") else ""
+    data = api_get(f"/gtfs-static/{agency}{suffix}", ttl=TTL["gtfs_static"],
+                   family="gtfs")
     z = zipfile.ZipFile(io.BytesIO(data))
     summary = {"agency": agency, "files": z.namelist()}
     for fname in ("routes.txt", "stops.txt", "trips.txt"):
@@ -410,8 +569,7 @@ def get_gtfs_static_summary(agency):
     return summary
 
 
-def get_gtfs_realtime(agency, category=None, limit=50):
-    THROTTLE.wait("gtfs")
+def get_gtfs_realtime(agency, category=None):
     if not re.match(r"^[a-z0-9-]{1,32}$", agency):
         raise invalid("agency must be lowercase letters, digits or hyphens",
                       agency=agency)
@@ -421,15 +579,8 @@ def get_gtfs_realtime(agency, category=None, limit=50):
     path = f"/gtfs-realtime/vehicle-position/{agency}"
     if category:
         path += f"?category={category}"
-    data = api_get(path)
-    vehicles = _parse_feed_message(data)
-    return {
-        "agency": agency,
-        "live_vehicles": len(vehicles),
-        "returned": min(len(vehicles), limit),
-        "truncated": len(vehicles) > limit,
-        "vehicles": vehicles[:limit],
-    }
+    data = api_get(path, ttl=TTL["gtfs_realtime"], family="gtfs")
+    return _parse_feed_message(data)
 
 
 # ---- Rapid KL live bus feed (myrapidbus kiosk data source) ----
@@ -456,9 +607,13 @@ def _rapid_post(url, payload):
         raise _upstream_error(e, url)
 
 
-def get_rapid_bus_live(provider="RKL", route="", limit=50):
-    t = int(time.time() * 1000)
-    handshake_url = f"{RAPID_URL}?EIO=4&transport=polling&t={t}"
+def _fetch_rapid_fleet(provider):
+    """One full socket.io round-trip for a provider's whole fleet.
+
+    Fetching the fleet unfiltered (rather than per route) means one upstream
+    hit serves every route query while the entry is warm.
+    """
+    handshake_url = f"{RAPID_URL}?EIO=4&transport=polling&t={int(time.time()*1000)}"
     open_text = http_get(handshake_url, timeout=20)[0].decode("utf-8", "replace")
     m = re.search(r'^0\{"sid":"([^"]+)"', open_text)
     if not m:
@@ -472,7 +627,10 @@ def get_rapid_bus_live(provider="RKL", route="", limit=50):
                 f'40{{"sid":"{RAPID_SID}","uid":""}}')
     _rapid_post(f"{base}&t={int(time.time()*1000)}",
                 f'42["onFts-reload",{{"sid":"{RAPID_SID}","uid":"",'
-                f'"provider":"{provider}","route":"{route}"}}]')
+                f'"provider":"{provider}","route":""}}]')
+    # The kiosk server needs a moment to push the first frame. This sleep is
+    # why the collector thread exists: it is paid off-request once per TTL
+    # window, not by every caller.
     time.sleep(1.5)
     poll_url = f"{base}&t={int(time.time()*1000)}"
     poll_text = http_get(poll_url, timeout=20)[0].decode("utf-8", "replace")
@@ -487,7 +645,6 @@ def get_rapid_bus_live(provider="RKL", route="", limit=50):
                         "myrapidbus kiosk feed returned no vehicle frame",
                         retryable=True, retry_after_seconds=15,
                         details={"raw": poll_text[:80]})
-    import base64
     import gzip as _gzip
     try:
         jdata = json.loads(_gzip.decompress(base64.b64decode(payload)).decode("utf-8"))
@@ -495,24 +652,128 @@ def get_rapid_bus_live(provider="RKL", route="", limit=50):
         raise ToolError("DATA_UNAVAILABLE",
                         f"could not decode the kiosk vehicle frame: {e}",
                         retryable=True, retry_after_seconds=15)
-    buses = jdata if isinstance(jdata, list) else []
-    return {
-        "provider": provider,
-        "route": route or "all",
-        "live_buses": len(buses),
-        "returned": min(len(buses), limit),
-        "truncated": len(buses) > limit,
-        "buses": [
-            {
-                "bus_no": b.get("bus_no"), "latitude": b.get("latitude"),
-                "longitude": b.get("longitude"), "route": b.get("route"),
-                "dir": b.get("dir"), "speed": b.get("speed"),
-                "angle": b.get("angle"), "dt_gps": b.get("dt_gps"),
-                "trip_no": b.get("trip_no"), "accessibility": b.get("accessibility"),
-            }
-            for b in buses[:limit]
-        ],
-    }
+    return jdata if isinstance(jdata, list) else []
+
+
+class RapidCollector:
+    """Keeps recently-requested Rapid fleets warm in the background.
+
+    A request used to pay a full handshake plus a 1.5s wait inline. Now the
+    first request for a provider pays that once, and a daemon thread refreshes
+    it every TTL window so later requests are served from cache immediately.
+    The thread only refreshes providers asked for in the last IDLE_AFTER
+    seconds, then exits — an idle server makes no upstream traffic.
+
+    REFRESH is deliberately shorter than the cache TTL: a round-trip takes
+    several seconds, so refreshing on the TTL boundary would let the entry
+    expire mid-fetch and drop the next caller back onto the slow path. The
+    TTL is the staleness bound (how old data may get if refreshes fail);
+    REFRESH is how often it is actually renewed.
+    """
+    IDLE_AFTER = 300
+    REFRESH = 20
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._demand = {}
+        self._thread = None
+
+    def _key(self, provider):
+        return f"rapid-fleet:{provider}"
+
+    def fleet(self, provider):
+        with self._lock:
+            self._demand[provider] = time.time()
+        key = self._key(provider)
+        cached = CACHE.get(key)
+        if cached is not None:
+            buses, age = cached
+            _trace_add("hit", age, TTL["rapid_bus"])
+            self._ensure_thread()
+            return buses
+        _trace_add("miss", 0, TTL["rapid_bus"])
+        buses = _fetch_rapid_fleet(provider)
+        CACHE.set(key, buses, TTL["rapid_bus"])
+        self._ensure_thread()
+        return buses
+
+    def _ensure_thread(self):
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="rapid-collector")
+            self._thread.start()
+
+    def _wanted(self):
+        cutoff = time.time() - self.IDLE_AFTER
+        with self._lock:
+            self._demand = {p: t for p, t in self._demand.items() if t > cutoff}
+            return list(self._demand)
+
+    def _run(self):
+        while True:
+            time.sleep(self.REFRESH)
+            providers = self._wanted()
+            if not providers:
+                return
+            for provider in providers:
+                try:
+                    CACHE.set(self._key(provider),
+                              _fetch_rapid_fleet(provider), TTL["rapid_bus"])
+                except ToolError:
+                    # A refresh failure just leaves the previous entry to
+                    # expire; the next request will surface the real error.
+                    pass
+
+    def status(self):
+        with self._lock:
+            running = bool(self._thread and self._thread.is_alive())
+            return {"running": running, "providers": sorted(self._demand)}
+
+
+RAPID = RapidCollector()
+
+
+def get_rapid_bus_live(provider="RKL", route=""):
+    """Whole-fleet snapshot for a provider, route-filtered locally.
+
+    Returns (buses, context); context explains an empty route filter rather
+    than leaving the caller with a bare zero.
+    """
+    fleet = RAPID.fleet(provider)
+    buses = fleet
+    if route:
+        want = route.upper()
+        exact = [b for b in buses if str(b.get("route", "")).upper() == want]
+        # Kiosk route codes are not always what riders say ("T200" is served by
+        # route "T2000"), so fall back to a prefix match rather than nothing.
+        buses = exact or [b for b in buses
+                          if str(b.get("route", "")).upper().startswith(want)]
+    context = {}
+    if route and not buses:
+        # Kiosk codes are 5-character ("U6000"), not the rider-facing numbers,
+        # so an empty result usually means the wrong code, not an idle route.
+        codes = sorted({str(b.get("route")) for b in fleet if b.get("route")})
+        context = {
+            "note": f"No bus is reporting on route '{route}'. Route codes in "
+                    f"this feed are the operator's own (e.g. 'U6000', "
+                    f"'T2000'), which may differ from the number on the bus.",
+            "known_route_count": len(codes),
+            "known_routes_sample": codes[:40],
+        }
+    rows = [
+        {
+            "bus_no": b.get("bus_no"), "latitude": b.get("latitude"),
+            "longitude": b.get("longitude"), "route": b.get("route"),
+            "dir": b.get("dir"), "speed": b.get("speed"),
+            "speed_unit": "km/h", "angle": b.get("angle"),
+            "dt_gps": b.get("dt_gps"), "trip_no": b.get("trip_no"),
+            "accessibility": b.get("accessibility"),
+        }
+        for b in buses
+    ]
+    return rows, context
 
 
 # ---- MCP protocol (stdio JSON-RPC 2.0) ----
@@ -523,33 +784,44 @@ def get_flood_risk():
     danger/warning/alert stations with a reading in the last 24h (dead gauges
     excluded), and slims each station to name/coords/level/trend/timestamp.
     """
-    data = http_get_json(f"{DASH}/api/flood?cb={int(time.time())}")
+    data = http_get_json(f"{DASH}/api/flood?cb={cache_bucket(TTL['flood'])}",
+                         ttl=TTL["flood"])
+    # JPS publishes lat/lon; every tool here reports latitude/longitude so a
+    # client never has to guess which spelling a given feed used.
+    stations = []
+    for s in data.get("stations", []):
+        st = dict(s)
+        st["latitude"] = st.pop("lat", None)
+        st["longitude"] = st.pop("lon", None)
+        stations.append(st)
     return {
         "updated": data.get("updated"),
         "at_risk": data.get("at_risk"),
+        "units": {"level": "metres", "dangerLevel": "metres",
+                  "margin": "metres"},
         "states": data.get("states", []),
-        "stations": data.get("stations", []),
+        "stations": stations,
     }
 
 
-def get_pricecatcher(item="", group="", limit=20):
-    """PriceCatcher grocery price index (KPDN, 198-item basket, daily)."""
-    data = http_get_json(f"{DASH}/prices.json")
+def get_pricecatcher(item="", group=""):
+    """PriceCatcher grocery price index (KPDN, 198-item basket).
+
+    Returns every matching item; the caller pages the list.
+    """
+    data = http_get_json(f"{DASH}/prices.json", ttl=TTL["prices"])
     q = str(item or "").strip().lower()
     grp = str(group or "").strip().upper()
-    lim = limit
+    months = data.get("months") or []
     items = data.get("items") or []
     if q:
         items = [it for it in items if q in str(it.get("n", "")).lower()]
     if grp:
         items = [it for it in items if str(it.get("g", "")) == grp]
-    matched = len(items)
-    items = items[:lim]
-    out = []
+    rows = []
     for it in items:
         p = it.get("p") or []
-        months = data.get("months") or []
-        out.append({
+        rows.append({
             "item": it.get("n"), "unit": it.get("u"), "group": it.get("g"),
             "kind": it.get("k"),
             "latest_price": p[-1] if p else None,
@@ -558,30 +830,26 @@ def get_pricecatcher(item="", group="", limit=20):
                               for i, v in enumerate(p) if i < len(months)],
         })
     basket = data.get("basket") or {}
-    return {
+    context = {
         "as_of": data.get("asOf"),
         "generated": data.get("generated"),
-        "months": data.get("months"),
+        "months": months,
         "currency": "MYR",
-        "matched": matched,
-        "returned": len(out),
-        "truncated": matched > len(out),
+        "units": {"latest_price": "MYR per item unit",
+                  "mom_pct": "percent", "yoy_pct": "percent"},
         "basket": {"n": basket.get("n"), "base": basket.get("base"),
                    "national_index": basket.get("national")} if basket else None,
-        "items": out,
     }
+    return rows, context
 
 
-def get_tourism(country="", limit=10):
+def get_tourism(country=""):
     """Monthly visitor arrivals (Tourism Malaysia, top 51, ~1 month lag)."""
-    data = http_get_json(f"{DASH}/tourism.json")
+    data = http_get_json(f"{DASH}/tourism.json", ttl=TTL["tourism"])
     q = str(country or "").strip().lower()
-    lim = limit
     rows = data.get("visitor") or []
     if q:
         rows = [r for r in rows if q in str(r.get("country", "")).lower()]
-    matched = len(rows)
-    rows = rows[:lim]
     out = [{
         "rank": r.get("rank"), "country": r.get("country"),
         "arrivals": r.get("cur"), "prev_month": r.get("prev"),
@@ -589,13 +857,14 @@ def get_tourism(country="", limit=10):
         "mom_pct": r.get("g_mom"), "ytd_arrivals": r.get("ytd26"),
         "ytd_yoy_pct": r.get("gy_yoy"),
     } for r in rows]
-    return {
+    context = {
         "as_of": data.get("asOf"), "generated": data.get("generated"),
         "totals": data.get("totals"),
-        "unit": "arrivals (persons)",
-        "matched": matched, "returned": len(out), "truncated": matched > len(out),
-        "countries": out,
+        "units": {"arrivals": "persons", "ytd_arrivals": "persons",
+                  "yoy_pct": "percent", "mom_pct": "percent",
+                  "vs_2019_pct": "percent"},
     }
+    return out, context
 
 
 def get_rapid_service_alert():
@@ -607,7 +876,7 @@ def get_rapid_service_alert():
     the newest post as rapid_alerts.json. This tool returns that file - the
     same data the dashboard's alert deck shows: one card, latest post only.
     """
-    data = http_get_json(f"{DASH}/rapid_alerts.json")
+    data = http_get_json(f"{DASH}/rapid_alerts.json", ttl=TTL["rapid_alert"])
     latest = data.get("latest") or {}
     return {
         "updated": data.get("updated"),
@@ -627,11 +896,20 @@ def get_air_quality():
     plus the cleanest station for comparison. US AQI 101+ is the haze
     alert threshold (Unhealthy).
     """
-    data = http_get_json(f"{DASH}/api/aqi?cb={int(time.time())}")
-    stations = data.get("stations") or []
+    data = http_get_json(f"{DASH}/api/aqi?cb={cache_bucket(TTL['aqi'])}",
+                         ttl=TTL["aqi"])
+    stations = []
+    for s in data.get("stations") or []:
+        st = dict(s)
+        try:  # the model publishes pm2.5 as a string
+            st["pm25"] = float(st["pm25"]) if st.get("pm25") is not None else None
+        except (TypeError, ValueError):
+            pass
+        stations.append(st)
     return {
         "updated": data.get("updated"),
         "aqi_scale": "US AQI",
+        "units": {"aqi": "US AQI index", "pm25": "µg/m³"},
         "reading_time": data.get("reading_time"),
         "worst": data.get("worst"),
         "cleanest": data.get("cleanest"),
@@ -648,7 +926,7 @@ def get_hotel_performance(state=""):
     earlier. Only the latest quarter is public on the source portal, so the
     dashboard collector probes newest-first; this returns the current quarter.
     """
-    data = http_get_json(f"{DASH}/hotel.json")
+    data = http_get_json(f"{DASH}/hotel.json", ttl=TTL["hotel"])
     out = {"asOf": data.get("asOf"), "generated": data.get("generated"),
            "source": data.get("source"),
            "units": {"occupancy_rate": "percent",
@@ -665,7 +943,7 @@ def get_hotel_performance(state=""):
     return out
 
 
-def get_election_results(category="", state="", query="", limit=50):
+def get_election_results(category="", state="", query=""):
     """Latest election results from SPR (Suruhanjaya Pilihan Raya), via the
     dashboard's election.json.
 
@@ -675,7 +953,7 @@ def get_election_results(category="", state="", query="", limit=50):
     matched against constituency, winner or party name. Results are static
     once published - this is a one-time crawl per election.
     """
-    data = http_get_json(f"{DASH}/election.json")
+    data = http_get_json(f"{DASH}/election.json", ttl=TTL["election"])
     seats = data.get("seats") or []
     if category:
         category = category.strip().lower()
@@ -697,6 +975,7 @@ def get_election_results(category="", state="", query="", limit=50):
                                 (w.get("partyShort") or w.get("party")) if w else ""]).lower()
                 return q in hay
             seats = [s for s in seats if _matches(s)]
+
     # compact per-seat view - candidates are the heavy part
     def _compact(s):
         w = next((c for c in (s.get("candidates") or []) if c.get("isWinner")), None)
@@ -709,15 +988,53 @@ def get_election_results(category="", state="", query="", limit=50):
             "votes": w.get("votes") if w else None,
             "majority": s.get("majority"), "totalVotes": s.get("totalVotes"),
         }
-    matched = len(seats)
-    page = seats[:limit]
-    return {"generated": data.get("generated"), "source": data.get("source"),
-            "note": data.get("note"),
-            "categories": {k: (v or {}).get("name")
-                           for k, v in (data.get("categories") or {}).items()},
-            "matched": matched, "returned": len(page),
-            "truncated": matched > len(page),
-            "seats": [_compact(s) for s in page]}
+
+    context = {
+        "generated": data.get("generated"), "source": data.get("source"),
+        "note": data.get("note"),
+        "units": {"votes": "votes", "majority": "votes", "totalVotes": "votes"},
+        "categories": {k: (v or {}).get("name")
+                       for k, v in (data.get("categories") or {}).items()},
+    }
+    return [_compact(s) for s in seats], context
+
+
+# Tools whose provenance is fixed, plus the two generic query tools whose
+# metadata has to come from data.gov.my per dataset.
+CATALOGUE_APIS = {"data-catalogue": "/data-catalogue", "opendosm": "/opendosm"}
+
+
+def get_dataset_info(api, dataset_id):
+    """Publisher metadata for one data.gov.my / OpenDOSM dataset.
+
+    Answers "how recent is this?" without making a client infer it from the
+    rows: who publishes it, when it was last updated, when the next update is
+    due, and what the columns are.
+    """
+    path = CATALOGUE_APIS[api]
+    payload = api_get(path, {"id": dataset_id, "limit": 1, "meta": "true",
+                             "sort": "-date"},
+                      ttl=TTL["catalogue"], family=api)
+    if not isinstance(payload, dict) or "meta" not in payload:
+        raise ToolError("NOT_FOUND",
+                        f"{api} has no dataset with id '{dataset_id}'",
+                        details={"dataset_id": dataset_id, "api": api})
+    meta = payload.get("meta") or {}
+    sample = (payload.get("data") or [{}])[0]
+    return {
+        "api": api,
+        "dataset_id": meta.get("catalogue_id", dataset_id),
+        "publisher": meta.get("data_source"),
+        "data_as_of": meta.get("data_as_of"),
+        "last_updated": meta.get("last_updated"),
+        "next_update": meta.get("next_update"),
+        "update_frequency": meta.get("update_frequency"),
+        "columns": sorted(sample) if sample else [],
+        "latest_row": sample or None,
+        "source_url": f"{BASE}{path}?id={dataset_id}",
+        "note": "Row counts are not reported here — this call fetches a single "
+                "row on purpose. Query the dataset itself for volume.",
+    }
 
 
 # Every tool is a read-only fetch from an external government/public API, so
@@ -734,7 +1051,16 @@ READ_ONLY = {
 def _limit(default, maximum, what):
     return {"type": "integer", "minimum": 1, "maximum": maximum,
             "default": default,
-            "description": f"Max {what} to return (default {default}, max {maximum})."}
+            "description": f"Page size — max {what} per page "
+                           f"(default {default}, max {maximum})."}
+
+
+CURSOR = {
+    "type": "string", "maxLength": 128,
+    "description": "Opaque cursor from a previous response's next_cursor. "
+                   "Omit for the first page; repeat the same filters when "
+                   "passing one.",
+}
 
 
 TOOLS = [
@@ -839,6 +1165,38 @@ TOOLS = [
         "annotations": READ_ONLY,
     },
     {
+        "name": "mygov_dataset_info",
+        "description": "Metadata for one data.gov.my or OpenDOSM dataset: who "
+                       "publishes it, what it is as of, when it was last "
+                       "updated, when the next update is due, its update "
+                       "frequency, its column names and the latest row.\n\n"
+                       "Call this before mygov_data_catalogue / mygov_opendosm "
+                       "when you need to know how current a dataset is, or "
+                       "which columns you can filter and sort on.\n\n"
+                       "Examples:\n"
+                       "- api='data-catalogue', dataset_id='fuelprice'\n"
+                       "- api='opendosm', dataset_id='cpi_core'",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "api": {
+                    "type": "string", "enum": ["data-catalogue", "opendosm"],
+                    "default": "data-catalogue",
+                    "description": "Which API the dataset lives in. "
+                                   "opendosm holds DOSM statistics; "
+                                   "data-catalogue holds everything else.",
+                },
+                "dataset_id": {
+                    "type": "string", "pattern": "^[a-z0-9_-]{2,64}$",
+                    "description": "Dataset id, e.g. 'fuelprice' or 'cpi_core'.",
+                },
+            },
+            "required": ["dataset_id"],
+            "additionalProperties": False,
+        },
+        "annotations": READ_ONLY,
+    },
+    {
         "name": "mygov_gtfs_static_summary",
         "description": "Summarize an agency's GTFS static schedule feed: file list, row "
                        "counts for routes/stops/trips, and a few sample routes. Use this "
@@ -889,6 +1247,7 @@ TOOLS = [
                     "description": "Required for agency='prasarana'; ignored otherwise.",
                 },
                 "limit": _limit(50, 500, "vehicles"),
+                "cursor": CURSOR,
             },
             "additionalProperties": False,
         },
@@ -917,6 +1276,7 @@ TOOLS = [
                     "description": "Route number filter, e.g. 'T200', '300'. Omit for the whole fleet.",
                 },
                 "limit": _limit(50, 500, "buses"),
+                "cursor": CURSOR,
             },
             "additionalProperties": False,
         },
@@ -958,6 +1318,7 @@ TOOLS = [
                     "description": "Item group filter.",
                 },
                 "limit": _limit(20, 200, "items"),
+                "cursor": CURSOR,
             },
             "additionalProperties": False,
         },
@@ -983,6 +1344,7 @@ TOOLS = [
                                    "(e.g. 'SINGAPORE', 'CHINA', 'INDIA').",
                 },
                 "limit": _limit(10, 60, "countries"),
+                "cursor": CURSOR,
             },
             "additionalProperties": False,
         },
@@ -1059,6 +1421,7 @@ TOOLS = [
                     "description": "Free text matched against constituency, winner or party name.",
                 },
                 "limit": _limit(50, 800, "seats"),
+                "cursor": CURSOR,
             },
             "additionalProperties": False,
         },
@@ -1118,6 +1481,16 @@ def enum_arg(tool, prop, args, default=None, upper=False):
     return val
 
 
+def dataset_id_arg(args):
+    dataset_id = str_arg(args, "dataset_id")
+    if not re.match(r"^[a-z0-9_-]{2,64}$", dataset_id):
+        raise invalid("dataset_id is required and must be a dataset slug "
+                      "(lowercase letters, digits, _ or -). Browse ids at "
+                      "https://data.gov.my/data-catalogue",
+                      dataset_id=args.get("dataset_id"))
+    return dataset_id
+
+
 def str_arg(args, prop, default=""):
     raw = args.get(prop)
     return default if raw is None else str(raw).strip()
@@ -1128,6 +1501,7 @@ def call_tool(name, args):
     if name not in TOOLS_BY_NAME:
         raise ToolError("NOT_FOUND", f"unknown tool: {name}",
                         details={"available": sorted(TOOLS_BY_NAME)})
+    cursor = str_arg(a, "cursor") or None
 
     if name == "mygov_weather_forecast":
         data = get_weather_forecast(str_arg(a, "location") or None,
@@ -1138,17 +1512,33 @@ def call_tool(name, args):
         return envelope(name, get_weather_warning())
 
     if name in ("mygov_data_catalogue", "mygov_opendosm"):
-        dataset_id = str_arg(a, "dataset_id")
-        if not re.match(r"^[a-z0-9_-]{2,64}$", dataset_id):
-            raise invalid("dataset_id is required and must be a dataset slug "
-                          "(lowercase letters, digits, _ or -)",
-                          dataset_id=a.get("dataset_id"))
+        dataset_id = dataset_id_arg(a)
         keys = ("filter", "contains", "sort", "date_start", "date_end")
         filters = {k: v for k, v in a.items() if k in keys and v}
         fetch = (get_data_catalogue if name == "mygov_data_catalogue"
                  else get_opendosm)
-        data = fetch(dataset_id, limit_arg(name, a), filters)
-        return envelope(name, data, dataset=dataset_id)
+        payload = fetch(dataset_id, limit_arg(name, a), filters)
+        # meta=true wraps the rows; unwrap it so `data` stays the rows and the
+        # publisher's own timestamps go where provenance belongs.
+        if isinstance(payload, dict) and "data" in payload:
+            upstream = payload.get("meta") or {}
+            rows = payload.get("data")
+        else:
+            upstream, rows = {}, payload
+        return envelope(name, rows, dataset=dataset_id,
+                        data_period=upstream.get("data_as_of"),
+                        data_updated_at=upstream.get("last_updated"),
+                        next_update=upstream.get("next_update"),
+                        update_frequency=upstream.get("update_frequency"),
+                        publisher=upstream.get("data_source"))
+
+    if name == "mygov_dataset_info":
+        api = enum_arg(name, "api", a, default="data-catalogue")
+        info = get_dataset_info(api, dataset_id_arg(a))
+        return envelope(name, info, dataset=info["dataset_id"],
+                        data_period=info.get("data_as_of"),
+                        data_updated_at=info.get("last_updated"),
+                        update_frequency=info.get("update_frequency"))
 
     if name == "mygov_gtfs_static_summary":
         agency = enum_arg(name, "agency", a, default="ktmb")
@@ -1161,8 +1551,12 @@ def call_tool(name, args):
             raise invalid("agency='prasarana' needs a category "
                           "(e.g. rapid-rail-kl)",
                           allowed=_schema(name, "category")["enum"])
-        data = get_gtfs_realtime(agency, category, limit_arg(name, a))
-        return envelope(name, data)
+        vehicles = get_gtfs_realtime(agency, category)
+        page, paging = paginate(vehicles, limit_arg(name, a), cursor,
+                                {"agency": agency, "category": category})
+        return envelope(name, {"agency": agency, "category": category,
+                               "live_vehicles": len(vehicles),
+                               "vehicles": page, **paging})
 
     if name == "mygov_rapid_bus_live":
         provider = enum_arg(name, "provider", a, default="RKL", upper=True)
@@ -1170,24 +1564,35 @@ def call_tool(name, args):
         if route and not re.match(r"^[A-Za-z0-9-]{1,16}$", route):
             raise invalid("route must be 1-16 letters, digits or hyphens "
                           "(e.g. 'T200', '300')", route=route)
-        data = get_rapid_bus_live(provider, route, limit_arg(name, a))
-        return envelope(name, data)
+        buses, context = get_rapid_bus_live(provider, route)
+        page, paging = paginate(buses, limit_arg(name, a), cursor,
+                                {"provider": provider, "route": route})
+        return envelope(name, {"provider": provider, "route": route or "all",
+                               "live_buses": len(buses), **context,
+                               "buses": page, **paging})
 
     if name == "mygov_flood_risk":
         data = get_flood_risk()
         return envelope(name, data, data_updated_at=data.get("updated"))
 
     if name == "mygov_pricecatcher":
-        data = get_pricecatcher(str_arg(a, "item"),
-                                enum_arg(name, "group", a, default="") or "",
-                                limit_arg(name, a))
-        return envelope(name, data, data_period=data.get("as_of"),
-                        data_updated_at=data.get("generated"))
+        item = str_arg(a, "item")
+        group = enum_arg(name, "group", a, default="") or ""
+        rows, context = get_pricecatcher(item, group)
+        page, paging = paginate(rows, limit_arg(name, a), cursor,
+                                {"item": item.lower(), "group": group})
+        return envelope(name, {**context, "items": page, **paging},
+                        data_period=context.get("as_of"),
+                        data_updated_at=context.get("generated"))
 
     if name == "mygov_tourism_arrivals":
-        data = get_tourism(str_arg(a, "country"), limit_arg(name, a))
-        return envelope(name, data, data_period=data.get("as_of"),
-                        data_updated_at=data.get("generated"))
+        country = str_arg(a, "country")
+        rows, context = get_tourism(country)
+        page, paging = paginate(rows, limit_arg(name, a), cursor,
+                                {"country": country.lower()})
+        return envelope(name, {**context, "countries": page, **paging},
+                        data_period=context.get("as_of"),
+                        data_updated_at=context.get("generated"))
 
     if name == "mygov_rapid_service_alert":
         data = get_rapid_service_alert()
@@ -1204,9 +1609,14 @@ def call_tool(name, args):
                         data_updated_at=data.get("generated"))
 
     if name == "mygov_election_results":
-        data = get_election_results(str_arg(a, "category"), str_arg(a, "state"),
-                                    str_arg(a, "query"), limit_arg(name, a))
-        return envelope(name, data, data_updated_at=data.get("generated"))
+        category, state = str_arg(a, "category"), str_arg(a, "state")
+        query = str_arg(a, "query")
+        rows, context = get_election_results(category, state, query)
+        page, paging = paginate(rows, limit_arg(name, a), cursor,
+                                {"category": category.lower(),
+                                 "state": state.upper(), "query": query.lower()})
+        return envelope(name, {**context, "seats": page, **paging},
+                        data_updated_at=context.get("generated"))
 
     raise ToolError("INTERNAL_ERROR", f"tool {name} is declared but not wired up")
 
@@ -1228,7 +1638,7 @@ def main():
             sys.stdout.write(json.dumps(rpc_response(mid, {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "mygov-api-mcp", "version": "1.0.0"},
+                "serverInfo": {"name": "mygov-api-mcp", "version": SERVER_VERSION},
             })) + "\n")
             sys.stdout.flush()
         elif method == "notifications/initialized":
@@ -1241,6 +1651,7 @@ def main():
             name = params.get("name")
             args = params.get("arguments", {})
             try:
+                _trace_reset()
                 result = call_tool(name, args)
                 payload, is_error = result, False
             except ToolError as e:

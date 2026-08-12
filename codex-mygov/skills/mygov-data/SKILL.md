@@ -11,6 +11,7 @@ Use the `mygov_*` MCP tools to query live Malaysian government open data. No API
 
 - `mygov_weather_forecast` — 7-day forecast; optional `location` filter ("Kota Bharu", "Langkawi"). Returns date, morning/afternoon/night text, min/max temp.
 - `mygov_weather_warning` — active MET Malaysia severe-weather warnings (no args).
+- `mygov_dataset_info` — publisher metadata for one catalogue/OpenDOSM dataset: source, `data_as_of`, `last_updated`, `next_update`, update frequency, column names, latest row. Call it first when you need to know how current a dataset is or which columns you can filter on.
 - `mygov_data_catalogue` — general gov datasets; known ids: `fuelprice` (RON95/97/diesel, sort=-date), `exchangerates`, `interestrates`, `poskod`.
 - `mygov_opendosm` — DOSM economics; ids: `cpi_core` (CPI), `ipi`, `ppi`, `sppi`, `iowrt`.
 - `mygov_gtfs_static_summary` — GTFS schedule ZIP summary: agencies ktmb, prasarana, mybas-kota-bharu, mybas-alor-setar, mybas-kuala-terengganu, mybas-johor-bahru.
@@ -49,12 +50,29 @@ lists the allowed values), `NOT_FOUND`, `UPSTREAM_TIMEOUT`,
 `INTERNAL_ERROR`. Only retry when `retryable` is true, after
 `retry_after_seconds`.
 
-## Result sizes
+## Result sizes and paging
 
-List tools default to a small page (10–50) and clamp `limit` to the schema's
-maximum. When a result carries `truncated: true`, `matched` tells you how many
-records matched in total — narrow the filter rather than raising `limit`. For
-`mygov_rapid_bus_live` always pass `route` when asking about one service.
+List tools return one page: `total` (all matching records), `returned`,
+`offset`, `has_more` and `next_cursor`. To continue, repeat the call with the
+same filters plus `cursor: <next_cursor>` — a cursor from a different query is
+rejected rather than silently paging the wrong result set. `limit` is clamped
+to the schema's maximum.
+
+Prefer narrowing the filter over paging through everything: say "198 items
+match, here are the first 20" rather than fetching all of them.
+
+## Caching
+
+Responses are cached per upstream, so repeated or paged calls are usually
+served locally: live vehicle feeds ~20s, flood 2 min, weather/AQI 10 min,
+prices 1h, tourism/hotel/election 24h. `meta.cache` reports `status`
+(hit/miss), `age_seconds` and `ttl_seconds` — quote `age_seconds` if a user
+asks how live a "live" number is.
+
+Rapid bus positions are refreshed by a background collector: the first call
+for a provider takes a few seconds, subsequent ones return instantly with
+data at most ~25s old. The collector stops itself after 5 minutes of no
+requests.
 
 ## Gotchas
 
@@ -62,3 +80,6 @@ records matched in total — narrow the filter rather than raising `limit`. For
 - The API rate-limits at 4 req/min per family; if you get 429s, wait and retry.
 - Fuel data is weekly and defaults to oldest first — always `sort=-date`.
 - Response text is often Bahasa Melayu ("Tiada hujan" = no rain).
+- Rapid route codes are the operator's own (`U6000`, `T2000`), not the number
+  painted on the bus — a zero result comes back with a sample of valid codes.
+- Coordinates are always `latitude` / `longitude`, never `lat` / `lon`.

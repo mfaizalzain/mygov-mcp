@@ -45,7 +45,7 @@ not enough for the public directory. You need:
    plus `Apps Management: Write` on your org role.
 4. Submit at **platform.openai.com/plugins** → Create plugin → With MCP:
    - Info tab: listing, logo, website/support/privacy/terms URLs
-   - MCP tab: server URL → **Scan Tools** → review 14 tools (all `readOnlyHint: true`)
+   - MCP tab: server URL → **Scan Tools** → review 15 tools (all `readOnlyHint: true`)
    - Prompts: 3+ starter prompts; Testing: 5 positive + 3 negative test cases
    - Global: country availability; Submit: release notes + attestations
 5. Approve → you choose when to publish → appears in the universal Plugins
@@ -55,6 +55,6 @@ not enough for the public directory. You need:
 
 - The local `.mcp.json` uses `${PLUGIN_ROOT}` so the bundled server resolves in
   the installed plugin.
-- All 14 tools are read-only — the server advertises `readOnlyHint: true`,
+- All 15 tools are read-only — the server advertises `readOnlyHint: true`,
   `destructiveHint: false`, `idempotentHint: true` and `openWorldHint: true`
   (every tool reads from an external government/public API).
