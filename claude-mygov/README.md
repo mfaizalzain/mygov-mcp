@@ -14,6 +14,24 @@ state, Tourism Malaysia), `mygov_election_results` (latest SPR election
 results: PRU-15, state elections for all 13 states, latest by-election —
 filter by category/state/search).
 
+## Transports
+
+```bash
+python3 servers/server.py              # stdio (what plugins use)
+python3 servers/server.py --http       # http://127.0.0.1:8765/mcp + /health
+python3 servers/server.py --health     # probe every source, exit non-zero if degraded
+```
+
+`--http` binds to localhost and rejects unknown browser Origins (pass
+`--allow-origin` to widen). Serve it publicly only behind a proxy you trust.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests            # offline, no network
+MYGOV_LIVE=1 python3 -m unittest discover -s tests   # + real upstreams
+```
+
 ## Local testing
 
 ```bash

@@ -1,0 +1,45 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Live upstreams change under us; a daily run catches a portal that has
+    # changed shape before a user does.
+    - cron: "0 22 * * *"
+
+jobs:
+  offline:
+    name: offline suite
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run tests (no network)
+        run: python -m unittest discover -s tests -v
+
+  live:
+    name: live upstreams
+    runs-on: ubuntu-latest
+    # Only where a failure means something actionable — a red mark on someone's
+    # PR because a government portal is down helps nobody.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run tests against real APIs
+        env:
+          MYGOV_LIVE: "1"
+        run: python -m unittest discover -s tests -v
+      - name: Probe every source
+        run: python claude-mygov/servers/server.py --health

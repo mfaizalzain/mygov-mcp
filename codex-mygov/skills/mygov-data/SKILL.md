@@ -11,6 +11,8 @@ Use the `mygov_*` MCP tools to query live Malaysian government open data. No API
 
 - `mygov_weather_forecast` — 7-day forecast; optional `location` filter ("Kota Bharu", "Langkawi"). Returns date, morning/afternoon/night text, min/max temp.
 - `mygov_weather_warning` — active MET Malaysia severe-weather warnings (no args).
+- `mygov_search` — **start here when you don't know a dataset id.** Searches 470+ data.gov.my and OpenDOSM datasets by topic and returns ids, titles, publishers and categories. The result's `api` field tells you which tool to query next. A zero result comes back with the list of categories that do exist — these portals genuinely don't cover every subject (road accident data, for instance, is not published there).
+- `mygov_health` — server, cache and collector state; `probe=true` also tests every upstream and reports which tools each affects. Use it when a tool has just failed and you need to know whether the source or the server is at fault.
 - `mygov_dataset_info` — publisher metadata for one catalogue/OpenDOSM dataset: source, `data_as_of`, `last_updated`, `next_update`, update frequency, column names, latest row. Call it first when you need to know how current a dataset is or which columns you can filter on.
 - `mygov_data_catalogue` — general gov datasets; known ids: `fuelprice` (RON95/97/diesel, sort=-date), `exchangerates`, `interestrates`, `poskod`.
 - `mygov_opendosm` — DOSM economics; ids: `cpi_core` (CPI), `ipi`, `ppi`, `sppi`, `iowrt`.
@@ -73,6 +75,16 @@ Rapid bus positions are refreshed by a background collector: the first call
 for a provider takes a few seconds, subsequent ones return instantly with
 data at most ~25s old. The collector stops itself after 5 minutes of no
 requests.
+
+## Typical flow
+
+```
+unknown topic → mygov_search → pick dataset_id
+             → mygov_dataset_info (how current? which columns?)
+             → mygov_data_catalogue / mygov_opendosm (the rows)
+```
+
+Don't guess dataset ids — search first. Guessed ids return NOT_FOUND.
 
 ## Gotchas
 

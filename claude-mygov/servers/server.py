@@ -8,6 +8,7 @@ Claude Code via:  claude mcp add -s user mygov -- python3 <this file>
 API reference: https://developer.data.gov.my  (base: https://api.data.gov.my)
 Rate limit: 4 req/min per API family — the server keeps a per-family throttle.
 """
+import argparse
 import base64
 import binascii
 import hashlib
@@ -24,6 +25,7 @@ import time
 import zipfile
 import io
 from collections import defaultdict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = "https://api.data.gov.my"
 DASH = "https://malaysia-at-a-glance.com"
@@ -137,7 +139,7 @@ TTL = {
     "rapid_bus": 90, "gtfs_realtime": 20, "flood": 120, "aqi": 600,
     "weather": 600, "weather_warning": 300, "rapid_alert": 300,
     "prices": 3600, "catalogue": 900, "tourism": 86400, "hotel": 86400,
-    "election": 86400, "gtfs_static": 86400,
+    "election": 86400, "gtfs_static": 86400, "catalogue_index": 86400,
 }
 
 # Per-tool-call record of whether the data came from cache, so meta.cache can
@@ -183,11 +185,25 @@ def http_get(url, headers=None, timeout=30, ttl=0):
             return value
         _trace_add("miss", 0, ttl)
     req = urllib.request.Request(url, headers=headers or {"User-Agent": UA})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            body, hdrs = r.read(), dict(r.headers)
-    except (urllib.error.URLError, socket.timeout, OSError) as e:
-        raise _upstream_error(e, url)
+    # These portals drop connections under load often enough that a single
+    # retry turns a visible failure into a slower success. Only connection-level
+    # faults are retried — an HTTP status is an answer, and repeating it would
+    # just spend rate-limit budget.
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body, hdrs = r.read(), dict(r.headers)
+            break
+        except urllib.error.HTTPError as e:
+            raise _upstream_error(e, url)
+        except (urllib.error.URLError, socket.timeout, OSError) as e:
+            reason = getattr(e, "reason", e)
+            transient = isinstance(reason, (ConnectionResetError, socket.timeout,
+                                            ConnectionAbortedError))
+            if attempt == 0 and transient:
+                time.sleep(0.5)
+                continue
+            raise _upstream_error(e, url)
     if ttl:
         CACHE.set(url, (body, hdrs), ttl)
     return body, hdrs
@@ -275,6 +291,15 @@ SOURCES = {
         "source": "Department of Statistics Malaysia (DOSM), OpenDOSM",
         "source_url": "https://api.data.gov.my/opendosm",
         "freshness": "varies", "update_frequency": "per dataset"},
+    "mygov_search": {
+        "source": "data.gov.my and OpenDOSM catalogue listings",
+        "source_url": "https://data.gov.my/data-catalogue",
+        "freshness": "daily", "update_frequency": "as datasets are published",
+        "max_age_seconds": 86400},
+    "mygov_health": {
+        "source": "mygov-mcp server",
+        "source_url": "https://github.com/mfaizalzain/mygov-mcp",
+        "freshness": "live", "update_frequency": "on request"},
     "mygov_dataset_info": {
         "source": "data.gov.my / OpenDOSM catalogue metadata",
         "source_url": "https://developer.data.gov.my",
@@ -1037,6 +1062,225 @@ def get_dataset_info(api, dataset_id):
     }
 
 
+# ---- dataset discovery ----
+# Neither portal publishes a machine-readable index of its catalogue, but both
+# are Next.js apps that embed the whole catalogue in the page's __NEXT_DATA__
+# blob. Parsing that is the only way to answer "what data exists about X?"
+# without hard-coding a list that goes stale. If the portals ever change shape
+# this degrades to DATA_UNAVAILABLE rather than wrong answers.
+CATALOGUE_PAGES = {
+    "data-catalogue": "https://data.gov.my/data-catalogue",
+    "opendosm": "https://open.dosm.gov.my/data-catalogue",
+}
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
+
+
+def get_catalogue_index(api):
+    """Every dataset one portal publishes, flattened to searchable records."""
+    url = CATALOGUE_PAGES[api]
+    body, _ = http_get(url, headers={"User-Agent": "Mozilla/5.0 mygov-mcp"},
+                       ttl=TTL["catalogue_index"])
+    m = _NEXT_DATA_RE.search(body.decode("utf-8", "replace"))
+    if not m:
+        raise ToolError("DATA_UNAVAILABLE",
+                        f"could not read the {api} catalogue index — the "
+                        f"portal's page structure has changed",
+                        retryable=False, details={"url": url})
+    try:
+        collection = (json.loads(m.group(1))["props"]["pageProps"]
+                      .get("collection") or {})
+    except (ValueError, KeyError) as e:
+        raise ToolError("DATA_UNAVAILABLE",
+                        f"could not parse the {api} catalogue index: {e}",
+                        retryable=False, details={"url": url})
+    out = []
+    for category, subcategories in collection.items():
+        for subcategory, rows in (subcategories or {}).items():
+            for row in rows or []:
+                if not row.get("id"):
+                    continue
+                out.append({
+                    "dataset_id": row.get("id"),
+                    "title": row.get("title"),
+                    "description": row.get("description"),
+                    "category": category,
+                    "subcategory": subcategory,
+                    "publisher": row.get("data_source"),
+                    "data_as_of": row.get("data_as_of"),
+                    "api": api,
+                })
+    return out
+
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokens(text):
+    return _TOKEN_RE.findall(str(text or "").lower())
+
+
+# Filler words match everything, and would reward a dataset for containing
+# "by" rather than the subject the caller actually asked about.
+_STOPWORDS = {"a", "an", "and", "as", "at", "by", "for", "from", "in", "of",
+              "on", "or", "per", "the", "to", "with", "data", "dataset",
+              "malaysia", "malaysian"}
+
+
+def _query_terms(query):
+    terms = [t for t in _tokens(query) if t not in _STOPWORDS]
+    # A query of pure filler still deserves an answer.
+    return terms or _tokens(query)
+
+
+def search_datasets(query, api=None):
+    """Rank catalogue datasets against a free-text query.
+
+    Deliberately not a "search everything" endpoint: it returns datasets to
+    query next, so an agent picks the right id instead of guessing one.
+    """
+    terms = _query_terms(query)
+    if not terms:
+        raise invalid("query must contain at least one word", query=query)
+    apis = [api] if api else list(CATALOGUE_PAGES)
+    datasets = []
+    for name in apis:
+        datasets.extend(get_catalogue_index(name))
+    # Same dataset is often listed on both portals; keep one entry per id.
+    seen, unique = set(), []
+    for d in datasets:
+        if d["dataset_id"] in seen:
+            continue
+        seen.add(d["dataset_id"])
+        unique.append(d)
+
+    scored = []
+    for d in unique:
+        title = set(_tokens(d["title"]))
+        ident = set(_tokens(d["dataset_id"]))
+        topic = set(_tokens(d["category"])) | set(_tokens(d["subcategory"]))
+        body = set(_tokens(d["description"]))
+        score = 0
+        matched = 0
+        for term in terms:
+            hit = 0
+            if term in ident:
+                hit += 4
+            if term in title:
+                hit += 3
+            if term in topic:
+                hit += 2
+            if term in body:
+                hit += 1
+            if not hit:  # prefix match catches plurals and partial words
+                if any(w.startswith(term) for w in title | ident):
+                    hit += 2
+                elif any(w.startswith(term) for w in topic | body):
+                    hit += 1
+            if hit:
+                matched += 1
+            score += hit
+        if not score:
+            continue
+        # Matching every term beats matching one term loudly.
+        scored.append((matched, score, d))
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]["dataset_id"]))
+    hits = [{**d, "relevance": {"terms_matched": matched, "score": score}}
+            for matched, score, d in scored]
+    context = {}
+    if not hits:
+        # A zero result usually means Malaysia does not publish that topic on
+        # these portals (road accident data, for instance, is not here), not
+        # that the search failed. Say which topics do exist so the caller can
+        # redirect instead of guessing dataset ids.
+        context = {
+            "note": f"No dataset in the {'/'.join(apis)} catalogue matches "
+                    f"'{query}'. These portals do not cover every subject — "
+                    f"the data may be published by an agency directly, or not "
+                    f"at all. Try a broader term before concluding it is "
+                    f"missing.",
+            "available_categories": sorted({d["category"] for d in unique}),
+        }
+    return hits, context
+
+
+# ---- health ----
+# Probe targets are the cheapest request that proves a source answers. Nothing
+# here exposes credentials or internals — these are the same public endpoints
+# the tools call.
+PROBES = {
+    "data_gov": (f"{BASE}/data-catalogue?id=fuelprice&limit=1",
+                 ["mygov_data_catalogue", "mygov_opendosm",
+                  "mygov_dataset_info"]),
+    "weather": (f"{BASE}/weather/warning", ["mygov_weather_forecast",
+                                            "mygov_weather_warning"]),
+    "catalogue_index": (CATALOGUE_PAGES["data-catalogue"], ["mygov_search"]),
+    "flood": (f"{DASH}/api/flood", ["mygov_flood_risk"]),
+    "aqi": (f"{DASH}/api/aqi", ["mygov_air_quality"]),
+    "prices": (f"{DASH}/prices.json", ["mygov_pricecatcher"]),
+    "tourism": (f"{DASH}/tourism.json", ["mygov_tourism_arrivals"]),
+    "hotel": (f"{DASH}/hotel.json", ["mygov_hotel_performance"]),
+    "election": (f"{DASH}/election.json", ["mygov_election_results"]),
+    "rapid_alert": (f"{DASH}/rapid_alerts.json", ["mygov_rapid_service_alert"]),
+    "rapid_bus": (f"{RAPID_URL}?EIO=4&transport=polling",
+                  ["mygov_rapid_bus_live"]),
+}
+
+
+def _probe_one(name, url, results, timeout=10):
+    started = time.time()
+    try:
+        http_get(url, timeout=timeout)
+        results[name] = {"status": "healthy",
+                         "latency_ms": int((time.time() - started) * 1000)}
+    except ToolError as e:
+        results[name] = {"status": "unhealthy", "code": e.code,
+                         "message": e.message,
+                         "latency_ms": int((time.time() - started) * 1000)}
+
+
+def get_health(probe=False):
+    """Server state, and optionally whether each upstream is answering.
+
+    Without probe=True this is instant and makes no network calls, so it is
+    safe to poll. Probing fans out across threads: sources are independent and
+    a slow one should not decide how long the check takes.
+    """
+    health = {
+        "server": "healthy",
+        "version": SERVER_VERSION,
+        "tools": len(TOOLS),
+        "cache": CACHE.stats(),
+        "rapid_collector": RAPID.status(),
+        "ttl_seconds": dict(TTL),
+        "checked_at": now_iso(),
+    }
+    if not probe:
+        health["sources"] = {"status": "not_probed",
+                             "hint": "call again with probe=true to test each "
+                                     "upstream (adds a few seconds)"}
+        return health
+    results = {}
+    threads = [threading.Thread(target=_probe_one, args=(n, u, results),
+                                daemon=True)
+               for n, (u, _tools) in PROBES.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+    sources = {}
+    for name, (_url, tools) in PROBES.items():
+        entry = results.get(name) or {"status": "unknown",
+                                      "message": "probe did not finish"}
+        sources[name] = {**entry, "affects": tools}
+    unhealthy = [n for n, v in sources.items() if v["status"] != "healthy"]
+    health["sources"] = sources
+    health["degraded"] = unhealthy
+    if unhealthy:
+        health["server"] = "degraded"
+    return health
+
+
 # Every tool is a read-only fetch from an external government/public API, so
 # they share the same annotation set: safe to call, safe to repeat, but the
 # world beyond this server is what answers (openWorldHint).
@@ -1160,6 +1404,68 @@ TOOLS = [
                              "description": "Inclusive end as YYYY-MM-DD@column."},
             },
             "required": ["dataset_id"],
+            "additionalProperties": False,
+        },
+        "annotations": READ_ONLY,
+    },
+    {
+        "name": "mygov_search",
+        "description": "Find Malaysian government datasets by topic. Searches "
+                       "the data.gov.my and OpenDOSM catalogues (470+ datasets) "
+                       "and returns the most relevant ones with their id, "
+                       "title, publisher, category and how current they are.\n\n"
+                       "This is the discovery step: use it when you do not "
+                       "already know a dataset id, then pass the id you pick to "
+                       "mygov_data_catalogue or mygov_opendosm (the result's "
+                       "`api` field tells you which).\n\n"
+                       "Examples:\n"
+                       "- query='road accidents'\n"
+                       "- query='household income poverty', limit=5\n"
+                       "- query='electricity', api='opendosm'\n\n"
+                       "It searches dataset titles and descriptions, not the "
+                       "data itself — it will not tell you the price of rice, "
+                       "it will tell you which dataset holds it.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string", "minLength": 2, "maxLength": 128,
+                    "description": "Topic in plain words, e.g. 'road accidents', "
+                                   "'unemployment by state', 'rainfall'.",
+                },
+                "api": {
+                    "type": "string", "enum": ["data-catalogue", "opendosm"],
+                    "description": "Restrict to one catalogue. Omit to search "
+                                   "both (recommended).",
+                },
+                "limit": _limit(10, 50, "datasets"),
+                "cursor": CURSOR,
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+        "annotations": READ_ONLY,
+    },
+    {
+        "name": "mygov_health",
+        "description": "Server and upstream status: version, tool count, cache "
+                       "and background-collector state, and the freshness "
+                       "contract (TTL per source).\n\n"
+                       "By default this is instant and makes no network calls. "
+                       "Pass probe=true to test every upstream government "
+                       "source and get per-source latency plus which tools each "
+                       "one affects — use that when a tool has just failed and "
+                       "you want to know whether the source or the whole server "
+                       "is down.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "probe": {
+                    "type": "boolean", "default": False,
+                    "description": "Actually contact each upstream source. "
+                                   "Adds a few seconds.",
+                },
+            },
             "additionalProperties": False,
         },
         "annotations": READ_ONLY,
@@ -1532,6 +1838,25 @@ def call_tool(name, args):
                         update_frequency=upstream.get("update_frequency"),
                         publisher=upstream.get("data_source"))
 
+    if name == "mygov_search":
+        query = str_arg(a, "query")
+        api = enum_arg(name, "api", a)
+        hits, context = search_datasets(query, api)
+        page, paging = paginate(hits, limit_arg(name, a), cursor,
+                                {"query": query.lower(), "api": api})
+        return envelope(name, {
+            "query": query,
+            "searched": [api] if api else sorted(CATALOGUE_PAGES),
+            **context,
+            "datasets": page,
+            "next_step": "Pass a dataset_id to mygov_dataset_info for its "
+                         "metadata, or to mygov_data_catalogue / mygov_opendosm "
+                         "(per the `api` field) for the rows.",
+            **paging})
+
+    if name == "mygov_health":
+        return envelope(name, get_health(probe=bool(a.get("probe"))))
+
     if name == "mygov_dataset_info":
         api = enum_arg(name, "api", a, default="data-catalogue")
         info = get_dataset_info(api, dataset_id_arg(a))
@@ -1621,8 +1946,55 @@ def call_tool(name, args):
     raise ToolError("INTERNAL_ERROR", f"tool {name} is declared but not wired up")
 
 
-def main():
-    initialized = False
+# ---- transports ----
+# The protocol layer is transport-agnostic: handle_message() turns one JSON-RPC
+# message into one response (or None for a notification). stdio and HTTP are
+# then thin loops around it.
+PROTOCOL_VERSION = "2024-11-05"
+
+
+def handle_message(msg):
+    """Handle one JSON-RPC message. Returns a response dict, or None."""
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        return rpc_response(mid, {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "mygov-api-mcp", "version": SERVER_VERSION},
+        })
+    if method == "notifications/initialized":
+        return None
+    if method == "tools/list":
+        return rpc_response(mid, {"tools": TOOLS})
+    if method == "tools/call":
+        params = msg.get("params", {})
+        try:
+            _trace_reset()
+            payload, is_error = call_tool(params.get("name"),
+                                          params.get("arguments", {})), False
+        except ToolError as e:
+            payload, is_error = e.to_dict(), True
+        except Exception as e:  # nothing should reach here; report it cleanly
+            payload = ToolError("INTERNAL_ERROR",
+                                f"{type(e).__name__}: {e}").to_dict()
+            is_error = True
+        # Tool failures come back as an isError result rather than a JSON-RPC
+        # error so the calling model can read the code and decide whether to
+        # retry, fix its arguments, or give up.
+        content = [{"type": "text",
+                    "text": json.dumps(payload, ensure_ascii=False, default=str)}]
+        return rpc_response(mid, {"content": content, "isError": is_error})
+    if method == "ping":
+        return rpc_response(mid, {})
+    if mid is not None:
+        # A request we do not implement (as opposed to a notification): answer
+        # with the standard code instead of leaving the client hanging.
+        return rpc_error(mid, -32601, f"method not found: {method}")
+    return None
+
+
+def serve_stdio():
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1631,55 +2003,157 @@ def main():
             msg = json.loads(line)
         except json.JSONDecodeError:
             continue
-        method = msg.get("method")
-        mid = msg.get("id")
-        if method == "initialize":
-            initialized = True
-            sys.stdout.write(json.dumps(rpc_response(mid, {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "mygov-api-mcp", "version": SERVER_VERSION},
-            })) + "\n")
+        response = handle_message(msg)
+        if response is not None:
+            sys.stdout.write(json.dumps(response) + "\n")
             sys.stdout.flush()
-        elif method == "notifications/initialized":
-            pass
-        elif method == "tools/list":
-            sys.stdout.write(json.dumps(rpc_response(mid, {"tools": TOOLS})) + "\n")
-            sys.stdout.flush()
-        elif method == "tools/call":
-            params = msg.get("params", {})
-            name = params.get("name")
-            args = params.get("arguments", {})
-            try:
-                _trace_reset()
-                result = call_tool(name, args)
-                payload, is_error = result, False
-            except ToolError as e:
-                payload, is_error = e.to_dict(), True
-            except Exception as e:  # nothing should reach here; report it cleanly
-                payload = ToolError("INTERNAL_ERROR",
-                                    f"{type(e).__name__}: {e}").to_dict()
-                is_error = True
-            # Tool failures come back as an isError result rather than a
-            # JSON-RPC error so the calling model can read the code and decide
-            # whether to retry, fix its arguments, or give up.
-            content = [{"type": "text",
-                        "text": json.dumps(payload, ensure_ascii=False, default=str)}]
-            sys.stdout.write(json.dumps(rpc_response(mid, {
-                "content": content,
-                "isError": is_error,
-            })) + "\n")
-            sys.stdout.flush()
-        elif method == "ping":
-            sys.stdout.write(json.dumps(rpc_response(mid, {})) + "\n")
-            sys.stdout.flush()
-        elif mid is not None:
-            # Unknown request (as opposed to a notification): answer with the
-            # standard JSON-RPC code instead of leaving the client hanging.
-            sys.stdout.write(json.dumps(rpc_error(
-                mid, -32601, f"method not found: {method}")) + "\n")
-            sys.stdout.flush()
+
+
+class MCPHTTPHandler(BaseHTTPRequestHandler):
+    """Streamable-HTTP transport: POST /mcp, plus GET /health for monitoring.
+
+    Responses are plain JSON rather than SSE — this server has no
+    server-initiated messages, and the spec allows a JSON response body.
+    """
+    server_version = f"mygov-mcp/{SERVER_VERSION}"
+    allowed_origins = None  # set by serve_http
+
+    def log_message(self, fmt, *args):  # keep stdout clean for the operator
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send(self, status, payload, ctype="application/json"):
+        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        origin = self.headers.get("Origin")
+        if origin and self._origin_ok(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, Mcp-Session-Id, MCP-Protocol-Version")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _origin_ok(self, origin):
+        """Reject cross-origin browser callers unless explicitly allowed.
+
+        A local MCP server on a known port is reachable from any web page the
+        user visits, so an unvalidated Origin is a DNS-rebinding foothold.
+        """
+        if self.allowed_origins == "*":
+            return True
+        host = urllib.parse.urlsplit(origin).hostname
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return True
+        return origin in (self.allowed_origins or set())
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        origin = self.headers.get("Origin")
+        if origin and self._origin_ok(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, Mcp-Session-Id, MCP-Protocol-Version")
+        self.end_headers()
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/health":
+            health = get_health(probe=False)
+            self._send(200 if health["server"] == "healthy" else 503, health)
+        elif path == "/mcp":
+            # No server-initiated stream to attach to.
+            self._send(405, {"error": "GET is not supported; POST JSON-RPC "
+                                      "messages to /mcp"})
+        else:
+            self._send(404, {"error": "not found; the MCP endpoint is /mcp"})
+
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path != "/mcp":
+            self._send(404, {"error": "not found; the MCP endpoint is /mcp"})
+            return
+        origin = self.headers.get("Origin")
+        if origin and not self._origin_ok(origin):
+            self._send(403, {"error": f"origin {origin} is not allowed"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 1_000_000:
+            self._send(400, rpc_error(None, -32600,
+                                      "missing or oversized request body"))
+            return
+        try:
+            msg = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        except json.JSONDecodeError as e:
+            self._send(400, rpc_error(None, -32700, f"parse error: {e}"))
+            return
+        # A client may batch messages in a list.
+        if isinstance(msg, list):
+            responses = [r for r in (handle_message(m) for m in msg)
+                         if r is not None]
+            if not responses:
+                self.send_response(202)
+                self.end_headers()
+                return
+            self._send(200, responses)
+            return
+        response = handle_message(msg)
+        if response is None:
+            self.send_response(202)  # notification: accepted, nothing to say
+            self.end_headers()
+            return
+        self._send(200, response)
+
+
+def serve_http(host="127.0.0.1", port=8765, allowed_origins=None):
+    MCPHTTPHandler.allowed_origins = allowed_origins
+    httpd = ThreadingHTTPServer((host, port), MCPHTTPHandler)
+    sys.stderr.write(f"mygov-mcp {SERVER_VERSION} listening on "
+                     f"http://{host}:{port}/mcp (health: /health)\n")
+    sys.stderr.flush()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(
+        description="MCP server for Malaysian government open data.")
+    parser.add_argument("--http", action="store_true",
+                        help="serve over HTTP instead of stdio")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="bind address for --http (default 127.0.0.1; "
+                             "use 0.0.0.0 only behind a proxy you trust)")
+    parser.add_argument("--port", type=int, default=8765,
+                        help="port for --http (default 8765)")
+    parser.add_argument("--allow-origin", action="append", metavar="ORIGIN",
+                        help="extra allowed Origin for --http; repeatable, or "
+                             "'*' to allow any")
+    parser.add_argument("--health", action="store_true",
+                        help="probe every upstream source, print JSON, exit "
+                             "non-zero if any is unhealthy")
+    args = parser.parse_args(argv)
+
+    if args.health:
+        health = get_health(probe=True)
+        print(json.dumps(health, indent=2, default=str))
+        return 1 if health.get("degraded") else 0
+    if args.http:
+        origins = args.allow_origin or []
+        serve_http(args.host, args.port,
+                   "*" if "*" in origins else set(origins))
+        return 0
+    serve_stdio()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
