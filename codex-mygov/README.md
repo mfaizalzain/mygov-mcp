@@ -35,10 +35,12 @@ codex mcp list
 The OpenAI portal scans your MCP server over **HTTPS** — a stdio-only bundle is
 not enough for the public directory. You need:
 
-1. **Host the server publicly** — expose the MCP server as streamable HTTP, e.g.
-   an `/mcp` route on the mygov Cloudflare Worker (malaysia-at-a-glance.com).
+1. **Host the server publicly** — already done: the mygov-mcp Worker serves
+   streamable HTTP at `https://mygov-mcp.faizalmzain.com/mcp` and
+   `https://mcp.malaysia-at-a-glance.com/mcp` (same Worker, two custom domains).
 2. **Domain verification** — host the portal token at
-   `https://malaysia-at-a-glance.com/.well-known/openai-apps-challenge`.
+   `https://mcp.malaysia-at-a-glance.com/.well-known/openai-apps-challenge`
+   (the Worker serves it from the `OPENAI_CHALLENGE_TOKEN` secret).
 3. **Verify identity** — individual or business verification in OpenAI Platform,
    plus `Apps Management: Write` on your org role.
 4. Submit at **platform.openai.com/plugins** → Create plugin → With MCP:
