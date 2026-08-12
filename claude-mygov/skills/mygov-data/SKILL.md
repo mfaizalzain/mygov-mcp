@@ -31,6 +31,31 @@ Use the `mygov_*` MCP tools to query live Malaysian government open data. No API
 - `date_start` / `date_end`: `YYYY-MM-DD@date`.
 - Nested fields: `location__location_name`.
 
+## Response shape
+
+Every tool returns `{"data": ..., "meta": {...}}`. Cite `meta.source` when
+reporting figures, and read the timestamps carefully:
+
+- `meta.retrieved_at` — when this server called the API (i.e. now).
+- `meta.data_period` — what the numbers actually describe (e.g. `2026-06` for
+  tourism). Say "June 2026 figures", not "today's figures".
+- `meta.data_updated_at` — when the publisher last refreshed the data.
+- `meta.freshness` — `live` / `daily` / `monthly` / `quarterly` / `static`.
+
+Failures return `{"error": {"code", "message", "retryable", ...}}` with
+`isError: true`. Codes: `INVALID_ARGUMENT` (fix the arguments — `details`
+lists the allowed values), `NOT_FOUND`, `UPSTREAM_TIMEOUT`,
+`UPSTREAM_RATE_LIMIT`, `UPSTREAM_UNAVAILABLE`, `DATA_UNAVAILABLE`,
+`INTERNAL_ERROR`. Only retry when `retryable` is true, after
+`retry_after_seconds`.
+
+## Result sizes
+
+List tools default to a small page (10–50) and clamp `limit` to the schema's
+maximum. When a result carries `truncated: true`, `matched` tells you how many
+records matched in total — narrow the filter rather than raising `limit`. For
+`mygov_rapid_bus_live` always pass `route` when asking about one service.
+
 ## Gotchas
 
 - Weather API has no coordinates — only location_id + location_name (Ds### district, St### state, Tn### town).

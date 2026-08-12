@@ -55,5 +55,6 @@ not enough for the public directory. You need:
 
 - The local `.mcp.json` uses `${PLUGIN_ROOT}` so the bundled server resolves in
   the installed plugin.
-- All 6 tools are read-only — the server already advertises
-  `readOnlyHint: true` / `openWorldHint: false` / `destructiveHint: false`.
+- All 14 tools are read-only — the server advertises `readOnlyHint: true`,
+  `destructiveHint: false`, `idempotentHint: true` and `openWorldHint: true`
+  (every tool reads from an external government/public API).
