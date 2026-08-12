@@ -30,6 +30,25 @@ codex mcp add mygov -- python3 ./servers/server.py
 codex mcp list
 ```
 
+## Transports
+
+```bash
+python3 servers/server.py              # stdio (what the plugin uses)
+python3 servers/server.py --http       # http://127.0.0.1:8765/mcp + /health
+python3 servers/server.py --health     # probe every source, exit non-zero if degraded
+```
+
+`--http` speaks streamable HTTP with JSON responses, binds to localhost and
+rejects unknown browser Origins (`--allow-origin` widens it). It is the
+straightforward way to put this behind the Worker for the OpenAI portal scan.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests            # offline, no network
+MYGOV_LIVE=1 python3 -m unittest discover -s tests   # + real upstreams
+```
+
 ## Publishing (universal directory)
 
 The OpenAI portal scans your MCP server over **HTTPS** — a stdio-only bundle is
@@ -45,7 +64,7 @@ not enough for the public directory. You need:
    plus `Apps Management: Write` on your org role.
 4. Submit at **platform.openai.com/plugins** → Create plugin → With MCP:
    - Info tab: listing, logo, website/support/privacy/terms URLs
-   - MCP tab: server URL → **Scan Tools** → review 15 tools (all `readOnlyHint: true`)
+   - MCP tab: server URL → **Scan Tools** → review 17 tools (all `readOnlyHint: true`)
    - Prompts: 3+ starter prompts; Testing: 5 positive + 3 negative test cases
    - Global: country availability; Submit: release notes + attestations
 5. Approve → you choose when to publish → appears in the universal Plugins
@@ -55,6 +74,6 @@ not enough for the public directory. You need:
 
 - The local `.mcp.json` uses `${PLUGIN_ROOT}` so the bundled server resolves in
   the installed plugin.
-- All 15 tools are read-only — the server advertises `readOnlyHint: true`,
+- All 17 tools are read-only — the server advertises `readOnlyHint: true`,
   `destructiveHint: false`, `idempotentHint: true` and `openWorldHint: true`
   (every tool reads from an external government/public API).
