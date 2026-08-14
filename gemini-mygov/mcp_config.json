@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mygov": {
+      "command": "python3",
+      "args": ["${PLUGIN_ROOT}/servers/server.py"]
+    },
+    "mygov-remote": {
+      "serverUrl": "https://mygov-mcp.faizalmzain.com/mcp"
+    }
+  }
+}

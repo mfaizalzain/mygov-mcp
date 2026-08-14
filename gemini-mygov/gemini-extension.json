@@ -1,0 +1,20 @@
+{
+  "name": "mygov",
+  "version": "1.0.0",
+  "description": "Malaysia government open data: weather, fuel prices, CPI, GTFS transit, live trains, buses and economic indicators.",
+  "author": {
+    "name": "Faizal Zain",
+    "url": "https://github.com/mfaizalzain"
+  },
+  "homepage": "https://malaysia-at-a-glance.com",
+  "repository": "https://github.com/mfaizalzain/mygov-mcp",
+  "license": "MIT",
+  "keywords": ["malaysia", "opendata", "weather", "gtfs", "data.gov.my", "gemini"],
+  "mcpServers": {
+    "mygov": {
+      "command": "python3",
+      "args": ["${extensionPath}/servers/server.py"]
+    }
+  },
+  "contextFileName": "GEMINI.md"
+}
